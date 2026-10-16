@@ -158,8 +158,14 @@ public:
 	explicit Heap(const T& x) : v(x) { acquire(); }
 	Heap(const Heap& o) : v(o.v) { acquire(); }
 	~Heap() { release(); }
-	Heap& operator=(const T& x) { release(); v = x; acquire(); return *this; }
-	Heap& operator=(const Heap& o) { if (this != &o) { release(); v = o.v; acquire(); } return *this; }
+	// Take the new reference before dropping the old one: the new value may be the very object this Heap
+	// is the last owner of (self-assignment through scratch storage), which release() would free.
+	Heap& operator=(const T& x) {
+		const T nv = x; JSRuntime* nrt = JSShim_GlobalRt();
+		if (nrt) JS_DupValueRT(nrt, J(nv));
+		release(); v = nv; rt = nrt; return *this;
+	}
+	Heap& operator=(const Heap& o) { if (this != &o) { *this = o.v; } return *this; }
 	void set(const T& x) { *this = x; }
 	const T& get() const { return v; }
 	operator const T&() const { return v; }

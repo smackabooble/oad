@@ -47,7 +47,7 @@ defs = ["-DNDEBUG", "-DCONFIG_FINAL=1", "-DCONFIG2_NVTT=0", "-DCONFIG2_LOBBY=0",
 incs = [SRC, f"{SRC}/pch/engine", SHIM, QJS, STUBS, f"{DEPS}/include", f"{DEPS}/include/SDL2",
         f"{DEPS}/include/freetype2", f"{DEPS}/include/libxml2", f"{ROOT}/deps/boost-inc",
         f"{SRC}/third_party/tinygettext/include", f"{GLAD}/include", f"{ROOT}/{SRCDIR}/libraries/source/cxxtest-4.4"]
-cflags = "-std=c++17 -pthread -fwasm-exceptions -O2 -fno-strict-aliasing -Wno-deprecated-declarations -Wno-unused-value " + " ".join(defs) + " " + " ".join(f"-I{i}" for i in incs)
+cflags = "-std=c++17 -pthread -fwasm-exceptions -O2 -fno-strict-aliasing -Wno-deprecated-declarations -Wno-unused-value " + " ".join(defs) + " " + " ".join(f"-I{i}" for i in incs) + " " + os.environ.get("OAD_XFLAGS", "")
 
 # --- COLLADA converter (FCollada + the game's converter), linked statically (no dlopen in the browser) ---
 import re
@@ -98,7 +98,7 @@ source {ROOT}/emsdk/emsdk_env.sh >/dev/null 2>&1
 P={DEPS}
 OUT=$1; shift
 cd {OUT}
-em++ -O2 -pthread -fwasm-exceptions libengine.a $P/lib/libboost_fs.a $P/lib/libqjs.a -L$P/lib -L$P/lib/static \\
+em++ -O2 -pthread -fwasm-exceptions {os.environ.get('OAD_XFLAGS', '')} libengine.a $P/lib/libboost_fs.a $P/lib/libqjs.a -L$P/lib -L$P/lib/static \\
   -lopenal -lenet -lfmt -lxml2 -lSDL2 -lpng16 -lfreetype -lvorbisfile -lvorbis -logg -lz -licui18n -licuuc -licudata -lsodium \\
   -sUSE_WEBGL2=1 -sFULL_ES3=1 -sALLOW_MEMORY_GROWTH=1 -sSTACK_SIZE=4MB -sINITIAL_MEMORY=512MB -sMAXIMUM_MEMORY=4GB \\
   -sMAX_WEBGL_VERSION=2 -sEXIT_RUNTIME=0 -sPTHREAD_POOL_SIZE=16 -sPTHREAD_POOL_SIZE_STRICT=0 \\

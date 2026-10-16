@@ -526,8 +526,18 @@
  	// get full path to executable
 
 --- a/source/ps/VideoMode.cpp	2025-04-28 20:20:24.000000000 +0000
-+++ b/source/ps/VideoMode.cpp	2026-10-16 13:45:26.429049096 +0000
-@@ -372,10 +372,17 @@
++++ b/source/ps/VideoMode.cpp	2026-10-16 16:20:15.777522224 +0000
+@@ -190,7 +190,8 @@
+ 			LOGERROR("Can't load hotspot for cursor: %s", pathHotspotName.string8().c_str());
+ 			return;
+ 		}
+-		std::wstringstream s(std::wstring(reinterpret_cast<const wchar_t*>(buffer.get()), size));
++		// The hotspot file is plain 8-bit text and `size` is in bytes (reading it as wchar_t overran the buffer).
++		std::stringstream s(std::string(reinterpret_cast<const char*>(buffer.get()), size));
+ 		s >> hotspotX >> hotspotY;
+ 	}
+ 
+@@ -372,10 +373,17 @@
  			else
  			{
  #if CONFIG2_GLES
