@@ -37,7 +37,7 @@ for d in dirs:
         files.append(rel)
 files.append("main.cpp")
 glad = f"{ROOT}/src/libraries/source/glad/src/gles2.cpp"
-extras = [f"{STUBS}/dir_watch_stub.cpp", f"{STUBS}/curl_stub.cpp", f"{STUBS}/wasm_stubs.cpp", f"{SRC}/mocks/mocks_real.cpp"]
+extras = [f"{STUBS}/dir_watch_stub.cpp", f"{STUBS}/curl_stub.cpp", f"{STUBS}/wasm_stubs.cpp", f"{STUBS}/wasm_platform.cpp", f"{SRC}/mocks/mocks_real.cpp"]
 
 defs = ["-DNDEBUG", "-DCONFIG_FINAL=1", "-DCONFIG2_AUDIO=0", "-DCONFIG2_NVTT=0", "-DCONFIG2_LOBBY=0",
         "-DCONFIG2_MINIUPNPC=0", "-DCONFIG2_GLES=1"]
@@ -74,6 +74,6 @@ em++ -O1 -pthread -fwasm-exceptions libengine.a $P/lib/libboost_fs.a $P/lib/libq
   -lenet -lfmt -lxml2 -lSDL2 -lpng16 -lfreetype -lvorbisfile -lvorbis -logg -lz -licui18n -licuuc -licudata -lsodium \\
   -sUSE_WEBGL2=1 -sFULL_ES3=1 -sALLOW_MEMORY_GROWTH=1 -sSTACK_SIZE=4MB -sINITIAL_MEMORY=512MB -sMAXIMUM_MEMORY=2GB \\
   -sMAX_WEBGL_VERSION=2 -sEXIT_RUNTIME=0 -sPTHREAD_POOL_SIZE=16 -sPTHREAD_POOL_SIZE_STRICT=0 \\
-  -Wl,--error-limit=0 -o $OUT "$@"
+  -Wl,--error-limit=0 -Wl,--wrap=vswprintf -o $OUT "$@"
 """)
 os.chmod(f"{OUT}/link.sh", 0o755)

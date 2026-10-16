@@ -42,3 +42,26 @@ namespace JSI_Lobby { void RegisterScriptFunctions(const ScriptRequest&) {} }
 // ---- Atlas editor (not part of the browser build) ----
 GameLoopState* g_AtlasGameLoop = nullptr;
 bool BeginAtlas(const CmdLineArgs&, const DllLoader&) { return false; }
+
+// ---- wide printf: musl does not understand the MS-style %hs / %hc (narrow string / char in a wide format) ----
+#include <wchar.h>
+#include <stdarg.h>
+#include <string>
+extern "C" int __real_vswprintf(wchar_t* s, size_t n, const wchar_t* fmt, va_list ap);
+extern "C" int __wrap_vswprintf(wchar_t* s, size_t n, const wchar_t* fmt, va_list ap)
+{
+	std::wstring f;
+	for (const wchar_t* p = fmt; *p;)
+	{
+		if (*p != L'%') { f.push_back(*p++); continue; }
+		f.push_back(*p++);
+		if (*p == L'%') { f.push_back(*p++); continue; }
+		// flags, width, precision
+		while (*p && wcschr(L"-+ #0123456789.*$", *p)) f.push_back(*p++);
+		// length modifier: drop a lone 'h' in front of s/c (the standard says %s/%c are already narrow here)
+		if (p[0] == L'h' && (p[1] == L's' || p[1] == L'c')) { ++p; continue; }
+		while (*p && wcschr(L"hlLjzt", *p)) f.push_back(*p++);
+		if (*p) f.push_back(*p++);
+	}
+	return __real_vswprintf(s, n, f.c_str(), ap);
+}

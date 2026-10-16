@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>0 A.D.</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+html,body{margin:0;height:100%;background:#111;color:#ccc;font:13px/1.4 monospace}
+#wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
+canvas{display:block;width:100vw;height:100vh;outline:none;background:#000}
+#log{position:fixed;left:0;bottom:0;max-height:30vh;overflow:auto;margin:0;padding:6px 8px;background:#000c;white-space:pre-wrap;width:100%;box-sizing:border-box}
+#log:empty{display:none}
+</style></head>
+<body><div id="wrap"><canvas id="canvas" tabindex="-1"></canvas></div><pre id="log"></pre>
+<script>
+const logEl = document.getElementById('log');
+function log(t){ console.log(t); logEl.textContent += t + '\n'; logEl.scrollTop = logEl.scrollHeight; }
+if (!window.crossOriginIsolated) log('Not cross-origin isolated: serve this folder with web/server.py (threads need COOP/COEP headers).');
+const canvas = document.getElementById('canvas');
+canvas.addEventListener('webglcontextlost', e => { e.preventDefault(); log('WebGL context lost'); }, false);
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+var Module = {
+  canvas,
+  print: log, printErr: log,
+  arguments: (new URLSearchParams(location.search).get('args') || '').split(' ').filter(Boolean),
+  onAbort: w => log('ABORT: ' + w),
+};
+</script>
+<script src="pyrogenesis.js"></script>
+</body></html>

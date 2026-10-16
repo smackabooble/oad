@@ -1,7 +1,7 @@
 From 88458ff8e359cca69ca61daf3f6736121be83c93 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Fri, 16 Oct 2026 07:36:24 +0000
-Subject: [PATCH 1/5] WASM/QuickJS port: add ARCH_WASM, adapt error reporting
+Subject: [PATCH 1/6] WASM/QuickJS port: add ARCH_WASM, adapt error reporting
  and generator helper
 
 Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>

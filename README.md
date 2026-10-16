@@ -17,12 +17,18 @@ Goal: build the real 0 A.D. engine for the browser with Emscripten, replacing Sp
   **Milestone:** under Node, headless (`-autostart=scenarios/arcadia -autostart-nonvisual`), the real game loads the map,
   all entity templates and all JS simulation components on QuickJS, prints `GAME STARTED, ALL INIT COMPLETE` with no
   errors, and runs the simulation (~240 turns/s). Threads, C++ exceptions, VFS, config, QuickJS shim all work.
-- Stubbed for the browser: lobby (gloox), Atlas editor, Vulkan, X11, curl (mod.io / user reports), dir watching, NVTT, UPnP.
-- Next (phase 5-8): WebGL2 rendering + browser main loop, game data delivery (lazy fetch), audio, packaging.
+- **Milestone 2: the real 0 A.D. main menu renders in headless Chromium** (see `web/screenshot-main-menu.png`):
+  game thread in a worker (PROXY_TO_PTHREAD + JSPI frame yield), WebGL2 via a patched SDL (`sdl/`),
+  game data fetched lazily from zip archives with HTTP Range requests (WasmFS fetch backend).
+- Stubbed for the browser: lobby (gloox), Atlas editor, Vulkan, X11, curl (mod.io / user reports), dir watching, NVTT
+  (replaced by an uncompressed-DDS fallback converter), UPnP, audio (not yet).
+- Next: interactivity (mouse/keyboard), start a match, performance, audio, saves/config persistence, packaging.
 
 ## Build
-1. `build/build_deps.sh` builds dependencies (needs emsdk, sources in deps/).
-2. `python3 build/gen_ninja.py && ninja -C build_mt && build_mt/link.sh pyrogenesis.html`.
+1. `build/build_deps.sh` builds dependencies (needs emsdk, sources in deps/). SDL needs the patch in `sdl/`.
+2. `python3 build/gen_ninja.py && ninja -C build_mt`, then link with `web/iter.sh` (it also runs a Chromium smoke test).
+3. Game data: `web/mkzip.py` packs a loose mod into <1.9 GB zips (the engine has no Zip64); `web/gen_manifest.py`
+   lists the files; `web/server.py` serves with Range + COOP/COEP headers (needed for threads).
 
 ## Notes
 - Needs `-sSTACK_SIZE=4MB` and `JS_SetMaxStackSize(rt, 3MB)` or QuickJS reports stack overflow.

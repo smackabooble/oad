@@ -281,13 +281,13 @@ bool ToInt32(JSContext* cx, HandleValue v, int32_t* out) { return JS_ToInt32(cx,
 bool ToUint32(JSContext* cx, HandleValue v, uint32_t* out) { return JS_ToUint32(cx, out, V(v)) >= 0; }
 bool ToUint16(JSContext* cx, HandleValue v, uint16_t* out) { uint32_t u; if (JS_ToUint32(cx, &u, V(v)) < 0) return false; *out = (uint16_t)u; return true; }
 bool ToInt64(JSContext* cx, HandleValue v, int64_t* out) { return JS_ToInt64(cx, out, V(v)) >= 0; }
-bool ToBoolean(HandleValue v) { return JS_ToBool(nullptr, V(v)) > 0; }
+bool ToBoolean(HandleValue v) { return JS_ToBool(t_globalCx, V(v)) > 0; }
 bool CallArgs::requireAtLeast(JSContext* cx, const char* fn, unsigned required) const {
 	if (argc_ >= required) return true;
 	JS_ThrowTypeError(cx, "%s requires at least %u argument(s)", fn, required); return false;
 }
 } // namespace JS
-bool JS_ObjectIsFunction(JSObject* obj) { return obj && JS_IsFunction(nullptr, VO(obj)); }
+bool JS_ObjectIsFunction(JSObject* obj) { return obj && JS_IsFunction(t_globalCx, VO(obj)); }
 
 // ---- strings ----
 JSString* JS_NewStringCopyN(JSContext* cx, const char* s, size_t n) {
