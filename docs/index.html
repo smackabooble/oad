@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>0 A.D.</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+html,body{margin:0;height:100%;background:#0b0b0b;color:#d8c9a3;font:14px/1.5 system-ui,sans-serif;overflow:hidden}
+canvas{display:block;width:100vw;height:100vh;outline:none;background:#000}
+#splash{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;background:#0b0b0b;transition:opacity .6s;z-index:5;text-align:center;padding:0 24px}
+#splash.done{opacity:0;pointer-events:none}
+#splash h1{margin:0;font-size:28px;letter-spacing:.08em;font-weight:600}
+#splash p{margin:0;max-width:560px;color:#a8a08a}
+.bar{width:260px;height:4px;background:#2a2518;border-radius:2px;overflow:hidden}
+.bar i{display:block;height:100%;width:40%;background:#c9a24a;animation:slide 1.4s infinite ease-in-out}
+@keyframes slide{0%{margin-left:-40%}100%{margin-left:100%}}
+#msg{color:#e6b66a;white-space:pre-wrap}
+#log{position:fixed;left:0;bottom:0;max-height:30vh;overflow:auto;margin:0;padding:6px 8px;background:#000c;white-space:pre-wrap;width:100%;box-sizing:border-box;font:12px/1.4 monospace;z-index:6}
+#log:empty{display:none}
+#dl{display:none;flex-direction:column;align-items:center;gap:12px;width:min(420px,90vw)}
+#dl button{background:#c9a24a;color:#1a1608;border:0;border-radius:4px;padding:10px 22px;font:600 15px system-ui;cursor:pointer}
+#pbar{width:100%;height:10px;background:#2a2518;border-radius:5px;overflow:hidden;display:none}
+#pbar i{display:block;height:100%;width:0;background:#c9a24a}
+#ptxt{font-size:13px;color:#a8a08a;min-height:20px}
+</style></head>
+<body>
+<canvas id="canvas" tabindex="-1"></canvas>
+<div id="splash"><h1>0 A.D.</h1><div class="bar" id="spin"><i></i></div>
+<p id="status">Loading&hellip;</p>
+<div id="dl"><button id="go">Download and play</button><div id="pbar"><i></i></div><div id="ptxt"></div></div>
+<p id="msg"></p></div>
+<pre id="log"></pre>
+
+<script>
+const params = new URLSearchParams(location.search);
+const debug = params.has('debug');
+const logEl = document.getElementById('log'), msgEl = document.getElementById('msg'), splash = document.getElementById('splash');
+function hideSplash(){ splash.classList.add('done'); setTimeout(() => splash.remove(), 800); }
+function log(t){
+  console.log(t);
+  if (/mainmenu\.xml|GAME STARTED|session\/session\.xml/.test(t)) hideSplash();
+  const important = /ERROR|ABORT|WARNING|isolated|unavailable/i.test(t);
+  if (important && !/COLLADA|get_average_color|OS error|dumping stack/.test(t)) msgEl.textContent = t.slice(0, 300);
+  if (!debug && !important) return;
+  logEl.textContent += t + '\n'; logEl.scrollTop = logEl.scrollHeight;
+}
+if (typeof WebAssembly.Suspending === 'undefined' && typeof WebAssembly.promising === 'undefined')
+  msgEl.textContent = 'This browser lacks WebAssembly JSPI support. Please use a recent Chromium-based browser (Chrome/Edge 137 or newer).';
+// Browsers keep audio suspended until the user interacts with the page: remember every AudioContext the engine
+// creates and resume them on the first click/key press.
+(function(){
+  const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return;
+  const ctxs = [];
+  function Patched(...args){ const c = new AC(...args); ctxs.push(c); return c; }
+  Patched.prototype = AC.prototype; window.AudioContext = Patched;
+  const unlock = () => ctxs.forEach(c => { if (c.state === 'suspended') c.resume(); });
+  ['pointerdown','keydown','touchend'].forEach(ev => addEventListener(ev, unlock, { capture: true }));
+})();
+const canvas = document.getElementById('canvas');
+canvas.addEventListener('webglcontextlost', e => { e.preventDefault(); log('ERROR: WebGL context lost - please reload the page'); }, false);
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+var Module = {
+  canvas,
+  print: log, printErr: log,
+  arguments: (params.get('args') || '').split(' ').filter(Boolean),
+  onAbort: w => log('ABORT: ' + w),
+};
+</script>
+<script>
+const statusEl=document.getElementById('status'), dl=document.getElementById('dl'), spin=document.getElementById('spin');
+const fmt=n=>n>=1e9?(n/1e9).toFixed(2)+' GB':(n/1e6).toFixed(0)+' MB';
+function bootEngine(){
+  statusEl.textContent='Starting the engine\u2026 the first start can take a minute.';
+  dl.style.display='none'; spin.style.display='';
+  const s=document.createElement('script'); s.src='pyrogenesis.js'; document.body.appendChild(s);
+}
+async function opfsComplete(){
+  try{
+    const d=await (await (await navigator.storage.getDirectory()).getDirectoryHandle('gamedata')).getFileHandle('_complete.json');
+    return JSON.parse(await (await d.getFile()).text());
+  }catch(e){return null;}
+}
+async function main(){
+  if(params.has('reset')){
+    await new Promise(r=>{const w=new Worker('dl-worker.js');w.onmessage=()=>r();w.postMessage({cmd:'wipe'});});
+    location.replace(location.pathname); return;
+  }
+  if(typeof WebAssembly.Suspending==='undefined'){return;}   // message already shown
+  const local = !('serviceWorker' in navigator) || (window.crossOriginIsolated && !navigator.serviceWorker.controller);
+  if(local){ if(!window.crossOriginIsolated) return; return bootEngine(); }   // served by serve.py
+  const reg=await navigator.serviceWorker.register('sw.js'); await navigator.serviceWorker.ready;
+  if(!window.crossOriginIsolated){
+    if(sessionStorage.getItem('oad-reloaded')){ msgEl.textContent='Could not enable cross-origin isolation (service worker blocked?).'; return; }
+    sessionStorage.setItem('oad-reloaded','1'); location.reload(); return;
+  }
+  let cfg;
+  try{ cfg=await (await fetch('data-config.json',{cache:'no-store'})).json(); }
+  catch(e){ statusEl.textContent='data-config.json missing - the game data host is not configured.'; return; }
+  const done=await opfsComplete();
+  if(done && done.version===cfg.version) return bootEngine();
+  const files=cfg.files.map(f=>({path:f.path,size:f.size,url:f.url||new URL(f.path,cfg.base.endsWith('/')?cfg.base:cfg.base+'/').href}));
+  const total=files.reduce((a,f)=>a+f.size,0);
+  let quotaMsg='';
+  try{ const e=await navigator.storage.estimate(); if(e.quota && e.quota-e.usage<total) quotaMsg=' Warning: browser storage may be too small ('+fmt(e.quota-e.usage)+' free).'; }catch(e){}
+  try{ await navigator.storage.persist(); }catch(e){}
+  spin.style.display='none';
+  statusEl.textContent='Game data needed: '+fmt(total)+'. It is saved in your browser, so this happens once.'+quotaMsg;
+  dl.style.display='flex';
+  const btn=document.getElementById('go'), pbar=document.getElementById('pbar'), bar=pbar.firstElementChild, ptxt=document.getElementById('ptxt');
+  btn.onclick=()=>{
+    btn.style.display='none'; pbar.style.display='block';
+    const w=new Worker('dl-worker.js');
+    w.onmessage=ev=>{
+      const m=ev.data;
+      if(m.type==='progress'){
+        bar.style.width=(100*m.done/m.total).toFixed(1)+'%';
+        const eta=m.bytesPerSec>0?Math.round((m.total-m.done)/m.bytesPerSec):0;
+        ptxt.textContent=fmt(m.done)+' / '+fmt(m.total)+' - '+(m.bytesPerSec/1e6).toFixed(1)+' MB/s'+(eta?' - '+Math.floor(eta/60)+'m '+eta%60+'s left':'');
+      }else if(m.type==='done'){ w.terminate(); bootEngine(); }
+      else if(m.type==='error'){ w.terminate(); ptxt.textContent='Error: '+m.message; btn.textContent='Retry (resumes)'; btn.style.display=''; }
+    };
+    w.postMessage({cmd:'start',files,version:cfg.version});
+  };
+}
+main().catch(e=>{msgEl.textContent='Error: '+e;});
+</script>
+</body></html>
