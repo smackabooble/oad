@@ -1,0 +1,39 @@
+{
+ "version": "1792156656",
+ "base": "https://huggingface.co/datasets/chalander/0ad-data/resolve/main/",
+ "files": [
+  {
+   "path": "config/default.cfg",
+   "size": 29925
+  },
+  {
+   "path": "config/keys.txt",
+   "size": 2525
+  },
+  {
+   "path": "mods/mod/mod.zip",
+   "size": 77681481
+  },
+  {
+   "path": "mods/public/mod.json",
+   "size": 193
+  },
+  {
+   "path": "mods/public/public.zip",
+   "size": 766081016
+  },
+  {
+   "path": "mods/public/public_1.zip",
+   "size": 977940932
+  },
+  {
+   "path": "mods/public/public_2.zip",
+   "size": 344302128
+  },
+  {
+   "path": "icu/icudt75l.dat",
+   "size": 30729184,
+   "url": "data_extra/icu/icudt75l.dat"
+  }
+ ]
+}
