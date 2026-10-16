@@ -33,8 +33,33 @@ const params = new URLSearchParams(location.search);
 const debug = params.has('debug');
 const logEl = document.getElementById('log'), msgEl = document.getElementById('msg'), splash = document.getElementById('splash');
 function hideSplash(){ splash.classList.add('done'); setTimeout(() => splash.remove(), 800); }
+const LOGKEY='oad-lastlog', RUNKEY='oad-running';
+const ring=[]; let ringDirty=false;
+function ringAdd(t){ ring.push(((performance.now()/1000)|0)+'s '+String(t).slice(0,300)); if(ring.length>400) ring.shift(); ringDirty=true; }
+function ringSave(){ if(!ringDirty) return; ringDirty=false; try{ localStorage.setItem(LOGKEY, ring.join('\n')); }catch(e){} }
+setInterval(()=>{
+  let m=''; try{ if(performance.memory) m=' jsheap='+(performance.memory.usedJSHeapSize/1048576|0)+'MB'; }catch(e){}
+  ringAdd('hb'+m); ringSave();
+}, 3000);
+try{
+  const prev=localStorage.getItem(RUNKEY), plog=localStorage.getItem(LOGKEY);
+  localStorage.setItem(RUNKEY,'1');
+  if(prev && plog){
+    const b=document.createElement('div');
+    b.style.cssText='position:fixed;top:0;left:0;right:0;z-index:20;background:#5a1d12;color:#fff;padding:8px 12px;font:13px system-ui;display:flex;gap:10px;align-items:center';
+    b.innerHTML='<span style="flex:1">The last session ended unexpectedly (crash or freeze).</span><button id="cplog">Copy its log</button><button id="xlog">Dismiss</button>';
+    addEventListener('DOMContentLoaded',()=>document.body.appendChild(b));
+    addEventListener('click',e=>{
+      if(e.target.id==='cplog'){ navigator.clipboard.writeText(plog).then(()=>{e.target.textContent='Copied - paste it to Claude';}).catch(()=>{prompt('Copy this log:',plog.slice(-6000));}); }
+      if(e.target.id==='xlog') b.remove();
+    });
+  }
+}catch(e){}
+addEventListener('pagehide',()=>{ ringAdd('pagehide'); ringSave(); try{ localStorage.removeItem(RUNKEY); }catch(e){} });
+addEventListener('error',e=>{ ringAdd('window error: '+e.message); ringSave(); });
+addEventListener('unhandledrejection',e=>{ ringAdd('unhandled rejection: '+(e.reason&&e.reason.message||e.reason)); ringSave(); });
 function log(t){
-  console.log(t);
+  console.log(t); ringAdd(t);
   if (/mainmenu\.xml|GAME STARTED|session\/session\.xml/.test(t)) hideSplash();
   const important = /ERROR|ABORT|WARNING|isolated|unavailable/i.test(t);
   if (important && !/COLLADA|get_average_color|OS error|dumping stack/.test(t)) msgEl.textContent = t.slice(0, 300);
