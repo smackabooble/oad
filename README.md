@@ -11,11 +11,18 @@ Goal: build the real 0 A.D. engine for the browser with Emscripten, replacing Sp
 - `patches/` — patches against upstream 0ad/0ad (`git am`).
 
 ## Status
-- Phase 2 (libraries) done: zlib, libpng, freetype, ogg/vorbis, SDL2, ICU (+ENet, fmt, libxml2) built for WASM.
-- Phase 3 (SpiderMonkey -> QuickJS) done at compile level: 73 of the 84 engine files that use the JS API
-  compile against the shim for wasm32; the other 11 only lack non-JS libraries/headers
-  (curl, sodium, miniupnpc, nvtt, aio.h, glad/vulkan) or a PCH include.
-- Nothing is linked or run yet. Next: phase 4 (build the whole engine, stub online features), then WebGL2.
+- Phase 2 (libraries) done: zlib, libpng, freetype, ogg/vorbis, SDL2, ICU, libsodium, ENet, fmt, libxml2, Boost.Filesystem.
+- Phase 3 (SpiderMonkey -> QuickJS) done: all JS-API users compile against the shim.
+- Phase 4 (whole engine): **all 445 engine sources compile and the engine LINKS** to pyrogenesis.wasm.
+  Under Node the real startup code runs (reaches `RunGameOrAtlas` / `TaskManager::Initialise`),
+  where it stops because the first build had no threads / C++ exceptions.
+  Now rebuilding everything with `-pthread -fwasm-exceptions` (`build/build_deps.sh`, `build/gen_ninja.py`).
+- Stubbed for the browser: lobby (gloox), Atlas editor, Vulkan, X11, curl (mod.io / user reports), dir watching, NVTT, UPnP.
+- Next: get past startup in Node, load game data (VFS), then WebGL2 rendering + browser main loop (phase 5).
+
+## Build
+1. `build/build_deps.sh` builds dependencies (needs emsdk, sources in deps/).
+2. `python3 build/gen_ninja.py && ninja -C build_mt && build_mt/link.sh pyrogenesis.html`.
 
 ## Notes
 - Needs `-sSTACK_SIZE=4MB` and `JS_SetMaxStackSize(rt, 3MB)` or QuickJS reports stack overflow.

@@ -1,7 +1,7 @@
 From 2b6fda5a277620174367a5a88d85b3882ca667f6 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Fri, 16 Oct 2026 07:44:32 +0000
-Subject: [PATCH 2/3] Port scriptinterface/ to QuickJS shim: context, promises,
+Subject: [PATCH 2/4] Port scriptinterface/ to QuickJS shim: context, promises,
  structured clone, conversions
 
 Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
