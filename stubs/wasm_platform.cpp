@@ -6,6 +6,15 @@
 #include <string.h>
 #include <string>
 
+// Absolute URL of the "data" folder next to the page/engine script, so the game also works when hosted
+// below the site root (e.g. GitHub Pages /oad/).
+EM_JS(char*, OadDataBaseUrl, (), {
+	var u = new URL('data', self.location.href).href;
+	var n = lengthBytesUTF8(u) + 1, p = _malloc(n);
+	stringToUTF8(u, p, n);
+	return p;
+});
+
 static void MkdirP(const std::string& path)
 {
 	for (size_t i = 1; i <= path.size(); ++i)
@@ -54,7 +63,8 @@ void WasmMountGameData()
 			fprintf(stderr, "WasmMountGameData: persistent storage unavailable; settings are not saved\n");
 	}
 
-	backend_t backend = wasmfs_create_fetch_backend("data", 1024 * 1024);
+	char* dataBase = OadDataBaseUrl();
+	backend_t backend = wasmfs_create_fetch_backend(dataBase, 1024 * 1024);
 	wasmfs_create_directory("/0ad/data", 0777, backend);
 
 	int count = 0;
