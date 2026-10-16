@@ -2,25 +2,56 @@
 <html lang="en"><head><meta charset="utf-8"><title>0 A.D.</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-html,body{margin:0;height:100%;background:#111;color:#ccc;font:13px/1.4 monospace}
-#wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
+html,body{margin:0;height:100%;background:#0b0b0b;color:#d8c9a3;font:14px/1.5 system-ui,sans-serif;overflow:hidden}
 canvas{display:block;width:100vw;height:100vh;outline:none;background:#000}
-#log{position:fixed;left:0;bottom:0;max-height:30vh;overflow:auto;margin:0;padding:6px 8px;background:#000c;white-space:pre-wrap;width:100%;box-sizing:border-box}
+#splash{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;background:#0b0b0b;transition:opacity .6s;z-index:5;text-align:center;padding:0 24px}
+#splash.done{opacity:0;pointer-events:none}
+#splash h1{margin:0;font-size:28px;letter-spacing:.08em;font-weight:600}
+#splash p{margin:0;max-width:560px;color:#a8a08a}
+.bar{width:260px;height:4px;background:#2a2518;border-radius:2px;overflow:hidden}
+.bar i{display:block;height:100%;width:40%;background:#c9a24a;animation:slide 1.4s infinite ease-in-out}
+@keyframes slide{0%{margin-left:-40%}100%{margin-left:100%}}
+#msg{color:#e6b66a;white-space:pre-wrap}
+#log{position:fixed;left:0;bottom:0;max-height:30vh;overflow:auto;margin:0;padding:6px 8px;background:#000c;white-space:pre-wrap;width:100%;box-sizing:border-box;font:12px/1.4 monospace;z-index:6}
 #log:empty{display:none}
 </style></head>
-<body><div id="wrap"><canvas id="canvas" tabindex="-1"></canvas></div><pre id="log"></pre>
+<body>
+<canvas id="canvas" tabindex="-1"></canvas>
+<div id="splash"><h1>0 A.D.</h1><div class="bar"><i></i></div>
+<p id="status">Starting the engine&hellip; game files are fetched from your computer on demand, so the first start can take a little while.</p><p id="msg"></p></div>
+<pre id="log"></pre>
 <script>
-const logEl = document.getElementById('log');
-const debug = new URLSearchParams(location.search).has('debug');
-function log(t){ console.log(t); if (!debug && !/ERROR|ABORT|WARNING|isolated/i.test(t)) return; logEl.textContent += t + '\n'; logEl.scrollTop = logEl.scrollHeight; }
-if (!window.crossOriginIsolated) log('Not cross-origin isolated: serve this folder with web/server.py (threads need COOP/COEP headers).');
+const params = new URLSearchParams(location.search);
+const debug = params.has('debug');
+const logEl = document.getElementById('log'), msgEl = document.getElementById('msg'), splash = document.getElementById('splash');
+function hideSplash(){ splash.classList.add('done'); setTimeout(() => splash.remove(), 800); }
+function log(t){
+  console.log(t);
+  if (/mainmenu\.xml|GAME STARTED|session\/session\.xml/.test(t)) hideSplash();
+  const important = /ERROR|ABORT|WARNING|isolated|unavailable/i.test(t);
+  if (important && !/COLLADA|get_average_color|OS error|dumping stack/.test(t)) msgEl.textContent = t.slice(0, 300);
+  if (!debug && !important) return;
+  logEl.textContent += t + '\n'; logEl.scrollTop = logEl.scrollHeight;
+}
+if (!window.crossOriginIsolated)
+  msgEl.textContent = 'This page is not cross-origin isolated. Start it with serve.py (it sets the required headers) and open http://localhost:PORT/ — not the file directly.';
+// Browsers keep audio suspended until the user interacts with the page: remember every AudioContext the engine
+// creates and resume them on the first click/key press.
+(function(){
+  const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return;
+  const ctxs = [];
+  function Patched(...args){ const c = new AC(...args); ctxs.push(c); return c; }
+  Patched.prototype = AC.prototype; window.AudioContext = Patched;
+  const unlock = () => ctxs.forEach(c => { if (c.state === 'suspended') c.resume(); });
+  ['pointerdown','keydown','touchend'].forEach(ev => addEventListener(ev, unlock, { capture: true }));
+})();
 const canvas = document.getElementById('canvas');
-canvas.addEventListener('webglcontextlost', e => { e.preventDefault(); log('WebGL context lost'); }, false);
+canvas.addEventListener('webglcontextlost', e => { e.preventDefault(); log('ERROR: WebGL context lost - please reload the page'); }, false);
 canvas.addEventListener('contextmenu', e => e.preventDefault());
 var Module = {
   canvas,
   print: log, printErr: log,
-  arguments: (new URLSearchParams(location.search).get('args') || '').split(' ').filter(Boolean),
+  arguments: (params.get('args') || '').split(' ').filter(Boolean),
   onAbort: w => log('ABORT: ' + w),
 };
 </script>

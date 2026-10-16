@@ -36,6 +36,24 @@ void WasmMountGameData()
 		return;
 	}
 
+	// Persistent storage (settings, saved games, replays, converted-texture cache) in the browser's
+	// origin-private file system. Falls back to the in-memory filesystem if unavailable.
+	{
+		backend_t opfs = wasmfs_create_opfs_backend();
+		if (opfs && wasmfs_create_directory("/home/web_user/persist", 0777, opfs) == 0)
+		{
+			MkdirP("/home/web_user/persist/config");
+			MkdirP("/home/web_user/persist/data");
+			MkdirP("/home/web_user/persist/cache");
+			setenv("XDG_CONFIG_HOME", "/home/web_user/persist/config", 1);
+			setenv("XDG_DATA_HOME", "/home/web_user/persist/data", 1);
+			setenv("XDG_CACHE_HOME", "/home/web_user/persist/cache", 1);
+			fprintf(stderr, "WasmMountGameData: persistent storage enabled (OPFS)\n");
+		}
+		else
+			fprintf(stderr, "WasmMountGameData: persistent storage unavailable; settings are not saved\n");
+	}
+
 	backend_t backend = wasmfs_create_fetch_backend("data", 1024 * 1024);
 	wasmfs_create_directory("/0ad/data", 0777, backend);
 

@@ -1,0 +1,63 @@
+From 8ff5ea04ba5e7f5c1d7fa33f74e05dbe512a5ed1 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 11:35:28 +0000
+Subject: [PATCH 8/8] Audio device name fix for browser OpenAL
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01V1KTZf1EfjbXMf1biK2Kv5
+---
+ source/main.cpp                      | 13 ++++++++++++-
+ source/soundmanager/SoundManager.cpp |  6 ++++++
+ 2 files changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/source/main.cpp b/source/main.cpp
+index 6db0565a..8e64f170 100644
+--- a/source/main.cpp
++++ b/source/main.cpp
+@@ -33,6 +33,17 @@ that of Atlas depending on commandline parameters.
+ 
+ #if defined(__EMSCRIPTEN__)
+ #include <emscripten.h>
++
++// Resolves on the next display refresh (falls back to a 16 ms timer where rAF is unavailable in workers).
++// Returning to the event loop here is also what makes the browser present the finished frame.
++EM_ASYNC_JS(void, oad_wait_for_next_frame, (), {
++	await new Promise(resolve => {
++		if (typeof requestAnimationFrame === 'function')
++			requestAnimationFrame(() => resolve());
++		else
++			setTimeout(resolve, 16);
++	});
++});
+ #endif
+ 
+ #include "lib/debug.h"
+@@ -713,7 +724,7 @@ static void RunGameOrAtlas(const PS::span<const char* const> argv)
+ #if defined(__EMSCRIPTEN__)
+ 			// Return to the browser's event loop so the finished frame is presented
+ 			// (an OffscreenCanvas in a worker only shows its content once the task ends).
+-			emscripten_sleep(0);
++			oad_wait_for_next_frame();
+ #endif
+ 		}
+ 
+diff --git a/source/soundmanager/SoundManager.cpp b/source/soundmanager/SoundManager.cpp
+index 57000f7e..a71fc2fe 100644
+--- a/source/soundmanager/SoundManager.cpp
++++ b/source/soundmanager/SoundManager.cpp
+@@ -838,6 +838,12 @@ void CSoundManager::RunHardwareDetection()
+ 		else
+ 			devices = alcGetString(nullptr, ALC_DEVICE_SPECIFIER);
+ 	}
++#if defined(__EMSCRIPTEN__)
++	// Browser OpenAL (Web Audio) cannot enumerate devices.
++	static const ALCchar webAudioName[] = "Web Audio\0";
++	if (!devices)
++		devices = webAudioName;
++#endif
+ 	WARN_IF_FALSE(devices);
+ 
+ 	m_SoundCardNames.clear();
+-- 
+2.43.0
+

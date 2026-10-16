@@ -40,12 +40,12 @@ files.append("lobby/Globals.cpp")
 glad = f"{ROOT}/src/libraries/source/glad/src/gles2.cpp"
 extras = [f"{STUBS}/dir_watch_stub.cpp", f"{STUBS}/curl_stub.cpp", f"{STUBS}/wasm_stubs.cpp", f"{STUBS}/wasm_platform.cpp", f"{SRC}/mocks/mocks_real.cpp"]
 
-defs = ["-DNDEBUG", "-DCONFIG_FINAL=1", "-DCONFIG2_AUDIO=0", "-DCONFIG2_NVTT=0", "-DCONFIG2_LOBBY=0",
+defs = ["-DNDEBUG", "-DCONFIG_FINAL=1", "-DCONFIG2_NVTT=0", "-DCONFIG2_LOBBY=0",
         "-DCONFIG2_MINIUPNPC=0", "-DCONFIG2_GLES=1"]
 incs = [SRC, f"{SRC}/pch/engine", SHIM, QJS, STUBS, f"{DEPS}/include", f"{DEPS}/include/SDL2",
         f"{DEPS}/include/freetype2", f"{DEPS}/include/libxml2", f"{ROOT}/deps/boost-inc",
         f"{SRC}/third_party/tinygettext/include", f"{ROOT}/src/libraries/source/glad/include", f"{ROOT}/src/libraries/source/cxxtest-4.4"]
-cflags = "-std=c++17 -pthread -fwasm-exceptions -O1 -fno-strict-aliasing -Wno-deprecated-declarations -Wno-unused-value " + " ".join(defs) + " " + " ".join(f"-I{i}" for i in incs)
+cflags = "-std=c++17 -pthread -fwasm-exceptions -O2 -fno-strict-aliasing -Wno-deprecated-declarations -Wno-unused-value " + " ".join(defs) + " " + " ".join(f"-I{i}" for i in incs)
 
 # --- COLLADA converter (FCollada + the game's converter), linked statically (no dlopen in the browser) ---
 import re
@@ -96,8 +96,8 @@ source {ROOT}/emsdk/emsdk_env.sh >/dev/null 2>&1
 P={DEPS}
 OUT=$1; shift
 cd {OUT}
-em++ -O1 -pthread -fwasm-exceptions libengine.a $P/lib/libboost_fs.a $P/lib/libqjs.a -L$P/lib -L$P/lib/static \\
-  -lenet -lfmt -lxml2 -lSDL2 -lpng16 -lfreetype -lvorbisfile -lvorbis -logg -lz -licui18n -licuuc -licudata -lsodium \\
+em++ -O2 -pthread -fwasm-exceptions libengine.a $P/lib/libboost_fs.a $P/lib/libqjs.a -L$P/lib -L$P/lib/static \\
+  -lopenal -lenet -lfmt -lxml2 -lSDL2 -lpng16 -lfreetype -lvorbisfile -lvorbis -logg -lz -licui18n -licuuc -licudata -lsodium \\
   -sUSE_WEBGL2=1 -sFULL_ES3=1 -sALLOW_MEMORY_GROWTH=1 -sSTACK_SIZE=4MB -sINITIAL_MEMORY=512MB -sMAXIMUM_MEMORY=2GB \\
   -sMAX_WEBGL_VERSION=2 -sEXIT_RUNTIME=0 -sPTHREAD_POOL_SIZE=16 -sPTHREAD_POOL_SIZE_STRICT=0 \\
   -Wl,--error-limit=0 -Wl,--wrap=vswprintf -o $OUT "$@"
