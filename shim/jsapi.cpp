@@ -58,6 +58,9 @@ bool DefProp(JSContext* cx, JSObject* obj, JSAtom a, JSValue v, unsigned attrs) 
 
 JSValue Trampoline(JSContext* cx, JSValueConst thisv, int argc, JSValueConst* argv, int, JSValue* data) {
 	JSNative fn = (JSNative)(intptr_t)JS_VALUE_GET_INT(data[0]);
+	// Natives run in the context (realm) that created them, as in SpiderMonkey: the callback data of the
+	// callee's interface must be seen even when a script of another interface (e.g. the AI) calls them.
+	cx = (JSContext*)(intptr_t)JS_VALUE_GET_INT(data[1]);
 	std::vector<Value> frame(argc + 2);
 	frame[0] = Value();
 	frame[1] = Value(thisv);
@@ -69,8 +72,8 @@ JSValue Trampoline(JSContext* cx, JSValueConst thisv, int argc, JSValueConst* ar
 	return JS_DupValue(cx, frame[0].raw());
 }
 JSValue NewNative(JSContext* cx, JSNative call, unsigned nargs, const char* name) {
-	JSValue data = JS_MKVAL(JS_TAG_INT, (int32_t)(intptr_t)call);
-	JSValue f = JS_NewCFunctionData(cx, Trampoline, (int)nargs, 0, 1, &data);
+	JSValue data[2] = { JS_MKVAL(JS_TAG_INT, (int32_t)(intptr_t)call), JS_MKVAL(JS_TAG_INT, (int32_t)(intptr_t)cx) };
+	JSValue f = JS_NewCFunctionData(cx, Trampoline, (int)nargs, 0, 2, data);
 	if (name) { JSValue n = JS_NewString(cx, name); JS_DefinePropertyValueStr(cx, f, "name", n, JS_PROP_CONFIGURABLE); }
 	return f;
 }
