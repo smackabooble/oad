@@ -34,11 +34,18 @@ const debug = params.has('debug');
 const logEl = document.getElementById('log'), msgEl = document.getElementById('msg'), splash = document.getElementById('splash');
 function hideSplash(){ splash.classList.add('done'); setTimeout(() => splash.remove(), 800); }
 const LOGKEY='oad-lastlog', RUNKEY='oad-running';
-const ring=[]; let ringDirty=false;
-function ringAdd(t){ ring.push(((performance.now()/1000)|0)+'s '+String(t).slice(0,300)); if(ring.length>400) ring.shift(); ringDirty=true; }
-function ringSave(){ if(!ringDirty) return; ringDirty=false; try{ localStorage.setItem(LOGKEY, ring.join('\n')); }catch(e){} }
+const ring=[], firstErr=[], seenCnt=new Map(); let ringDirty=false;
+function ringAdd(t){
+  t=String(t).slice(0,300);
+  const k=t.replace(/[0-9.]+/g,'#'); const c=(seenCnt.get(k)||0)+1; seenCnt.set(k,c);
+  if(c>3 && /ABORT|Abort|window error|proxy_async|error/i.test(t)){ if(c%1000===0) t+=' (repeated '+c+' times)'; else return; }
+  const line=((performance.now()/1000)|0)+'s '+t;
+  if(firstErr.length<40 && /ERROR|ABORT|Abort|Assertion|unreachable|out of memory|window error|rejection|lost/i.test(t) && !/audio device|COLLADA|get_average/.test(t)) firstErr.push(line);
+  ring.push(line); if(ring.length>300) ring.shift(); ringDirty=true;
+}
+function ringSave(){ if(!ringDirty) return; ringDirty=false; try{ localStorage.setItem(LOGKEY, 'FIRST ERRORS:\n'+firstErr.join('\n')+'\n\nRECENT:\n'+ring.join('\n')); }catch(e){} }
 setInterval(()=>{
-  let m=''; try{ if(performance.memory) m=' jsheap='+(performance.memory.usedJSHeapSize/1048576|0)+'MB'; }catch(e){}
+  let m=''; try{ if(performance.memory) m=' jsheap='+(performance.memory.usedJSHeapSize/1048576|0)+'MB'; if(typeof wasmMemory!=='undefined') m+=' wasm='+(wasmMemory.buffer.byteLength/1048576|0)+'MB'; }catch(e){}
   ringAdd('hb'+m); ringSave();
 }, 3000);
 try{
