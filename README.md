@@ -1,3 +1,9 @@
+# 0 A.D. in the browser (unofficial WebAssembly port)
+
+Runs the real 0 A.D. engine (Alpha 27 "Agni") in a Chromium-based browser tab, using your own copy of the game data.
+
+**To play:** `python3 dist/serve.py --data "<your 0 A.D. data folder>"` and open http://localhost:8080/ — see `dist/README.md`.
+
 # 0 A.D. in the browser (WASM + QuickJS) — work in progress
 
 Goal: build the real 0 A.D. engine for the browser with Emscripten, replacing SpiderMonkey 91
@@ -25,7 +31,13 @@ Goal: build the real 0 A.D. engine for the browser with Emscripten, replacing Sp
   FCollada linked statically (no dlopen), lobby stubs registered, GLSL ES loop fix.
 - Stubbed for the browser: lobby (gloox), Atlas editor, Vulkan, X11, curl (mod.io / user reports), dir watching, NVTT
   (replaced by an uncompressed-DDS fallback converter), UPnP, audio (not yet).
-- Next: verify input, performance tuning, audio (OpenAL), saves/config persistence (IndexedDB), packaging for the user's own 0 A.D. install.
+- **Milestone 4 (current): playable package.** Release build in `dist/` (9 MB wasm), `serve.py` launcher that serves the
+  user's own game data with Range support + COOP/COEP, audio (OpenAL/Web Audio, unlocked on first click), persistent
+  settings/saves/texture cache (OPFS), resize handling, mouse/keyboard input verified in headless Chromium.
+  Verified: main menu + submenus, starting a match via autostart, selecting units, camera, FPS overlay.
+- Not verifiable in this environment: real-GPU performance (tests ran on a software GL emulator: ~15 FPS at 480x270),
+  audible sound, DXT-compressed textures from an official release's pre-converted archives (only raw source textures,
+  converted by the built-in fallback, were available), Firefox/Safari (need JSPI, Chromium 137+ only).
 
 ## Build
 1. `build/build_deps.sh` builds dependencies (needs emsdk, sources in deps/). SDL needs the patch in `sdl/`.

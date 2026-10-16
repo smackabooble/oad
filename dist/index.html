@@ -33,6 +33,8 @@ function log(t){
   if (!debug && !important) return;
   logEl.textContent += t + '\n'; logEl.scrollTop = logEl.scrollHeight;
 }
+if (typeof WebAssembly.Suspending === 'undefined' && typeof WebAssembly.promising === 'undefined')
+  msgEl.textContent = 'This browser lacks WebAssembly JSPI support. Please use a recent Chromium-based browser (Chrome/Edge 137 or newer).';
 if (!window.crossOriginIsolated)
   msgEl.textContent = 'This page is not cross-origin isolated. Start it with serve.py (it sets the required headers) and open http://localhost:PORT/ — not the file directly.';
 // Browsers keep audio suspended until the user interacts with the page: remember every AudioContext the engine
