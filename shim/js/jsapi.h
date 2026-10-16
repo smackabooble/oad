@@ -7,6 +7,7 @@ extern "C" {
 #include "quickjs.h"
 }
 #include <cmath>
+#include <cstring>
 #include <cstdint>
 #include <cstddef>
 #include <vector>
@@ -57,9 +58,15 @@ public:
 	void setObjectOrNull(JSObject* o) { v = o ? JS_MKPTR(JS_TAG_OBJECT, o) : JS_NULL; }
 	void set(const Value& o) { v = o.v; }
 	void setRaw(JSValue x) { v = x; }
+	friend bool operator==(const Value& a, const Value& b) { return memcmp(&a.v, &b.v, sizeof(JSValue)) == 0; }
+	friend bool operator!=(const Value& a, const Value& b) { return !(a == b); }
+	// Private pointers are stored as tagged ints (wasm32: pointers are 32 bits).
+	void setPrivate(void* p) { static_assert(sizeof(void*) == 4, "wasm32 only"); v = JS_MKVAL(JS_TAG_INT, (int32_t)(uintptr_t)p); }
+	void* toPrivate() const { return (void*)(uintptr_t)(uint32_t)JS_VALUE_GET_INT(v); }
 };
 
 inline Value UndefinedValue() { return Value(JS_UNDEFINED); }
+inline Value NaNValue() { return Value(JS_NAN); }
 inline Value NullValue() { return Value(JS_NULL); }
 inline Value BooleanValue(bool b) { return Value(JS_NewBool(nullptr, b)); }
 inline Value Int32Value(int32_t i) { return Value(JS_MKVAL(JS_TAG_INT, i)); }

@@ -1,7 +1,10 @@
 // Part 2 of the shim: handles, rooted types, owning heap types. Included from jsapi.h.
 #pragma once
 #include <type_traits>
+namespace mozilla { template<typename T> class Maybe; }
 namespace JS {
+template<typename T> struct IsMaybe : std::false_type {};
+template<typename T> struct IsMaybe<mozilla::Maybe<T>> : std::true_type {};
 
 template<typename T> struct Conv;
 template<> struct Conv<Value> {
@@ -64,6 +67,12 @@ template<typename T> class PersistentRooted;
 	void setString(JSString* str) const { VW() = Value(Conv<JSString*>::to(str)); }
 
 template<typename T, typename D, bool Mut> struct Ops {};
+class RootedIdVector;
+template<typename D, bool Mut> struct Ops<RootedIdVector, D, Mut> {
+	const RootedIdVector& IR() const { return static_cast<const D*>(this)->get(); }
+	size_t length() const;
+	const struct PropertyKey& operator[](size_t i) const;
+};
 template<typename D> struct Ops<Value, D, false> {
 	const Value& VR() const { return static_cast<const D*>(this)->get(); }
 	JSSHIM_VALUE_READ_OPS
@@ -83,7 +92,7 @@ public:
 	Handle(const Rooted<T>& r) : p(&r.get()) {}
 	Handle(const MutableHandle<T>& m) : p(&m.get()) {}
 	Handle(const Heap<T>& h) : p(h.address()) {}
-	Handle(const PersistentRooted<T>& r) : p(r.address()) {}
+	Handle(const PersistentRooted<T>& r) : p(&r.get()) {}
 	const T& get() const { return *p; }
 	operator const T&() const { return *p; }
 	decltype(auto) operator*() const { if constexpr (std::is_pointer_v<T>) return **p; else return (*p); }
@@ -97,6 +106,7 @@ class MutableHandle : public Ops<T, MutableHandle<T>, true> {
 public:
 	MutableHandle(T* ptr) : p(ptr) {}
 	MutableHandle(Rooted<T>* r) : p(&r->get()) {}
+	MutableHandle(PersistentRooted<T>* r) : p(r->operator&().address()) {}
 	T& get() const { return *p; }
 	operator T&() const { return *p; }
 	T& operator*() const { return *p; }
@@ -112,20 +122,22 @@ class Rooted : public Ops<T, Rooted<T>, true> {
 	T v;
 public:
 	explicit Rooted(JSContext*) : v() {}
-	Rooted(JSContext*, const T& init) : v(init) {}
-	Rooted(JSContext*, const Handle<T>& init) : v(init.get()) {}
-	Rooted(JSContext*, const MutableHandle<T>& init) : v(init.get()) {}
+	template<typename U, typename = std::enable_if_t<std::is_convertible_v<const U&, T>>>
+	Rooted(JSContext*, const U& init) : v(init) {}
 	Rooted(const Rooted&) = delete;
 	T& get() { return v; }
 	const T& get() const { return v; }
 	T* address() { return &v; }
 	const T* address() const { return &v; }
 	operator const T&() const { return v; }
+	void set(const T& x) { v = x; }
 	Rooted& operator=(const T& x) { v = x; return *this; }
 	Rooted& operator=(const Handle<T>& x) { v = x.get(); return *this; }
 	decltype(auto) operator*() const { if constexpr (std::is_pointer_v<T>) return *v; else return (v); }
 	MutableHandle<T> operator&() { return MutableHandle<T>(&v); }
-	auto operator->() const { if constexpr (std::is_pointer_v<T>) return v; else return &v; }
+	auto operator->() const { if constexpr (std::is_pointer_v<T>) return v; else if constexpr (IsMaybe<T>::value) return &v.ref(); else return &v; }
+	auto operator->() { if constexpr (std::is_pointer_v<T>) return v; else if constexpr (IsMaybe<T>::value) return &v.ref(); else return &v; }
+	bool isSome() const { if constexpr (IsMaybe<T>::value) return v.isSome(); else return false; }
 };
 
 // Owning variants hold a real refcount so they can outlive the request.
@@ -153,26 +165,44 @@ public:
 	void init(const T& x) { *this = x; }
 };
 
+// Writes through `&persistent` land in scratch storage; they are turned into real references
+// (a) the next time the object is read and (b) before the temp pool is released.
+struct PersistentSyncBase { virtual void sync() = 0; bool registered_ = false; virtual ~PersistentSyncBase() {} };
+void JSShim_RegisterDirty(PersistentSyncBase*);
+void JSShim_UnregisterDirty(PersistentSyncBase*);
+
 template<typename T>
-class PersistentRooted : public Ops<T, PersistentRooted<T>, true> {
+class PersistentRooted : public Ops<T, PersistentRooted<T>, true>, public PersistentSyncBase {
 	Heap<T> h;
+	T tmp{};
+	bool dirty = false;
 public:
 	PersistentRooted() {}
 	explicit PersistentRooted(JSContext*) {}
-	PersistentRooted(JSContext*, const T& x) : h(x) {}
-	PersistentRooted(JSContext*, const Handle<T>& x) : h(x.get()) {}
+	PersistentRooted(const PersistentRooted& o) : h(o.get()) {}
+	~PersistentRooted() { if (registered_) JSShim_UnregisterDirty(this); }
+	template<typename U, typename = std::enable_if_t<std::is_convertible_v<const U&, T>>>
+	PersistentRooted(JSContext*, const U& x) : h(static_cast<const T&>(x)) {}
 	void init(JSContext*) {}
-	void init(JSContext*, const T& x) { h = x; }
-	void init(JSContext*, const Rooted<T>& x) { h = x.get(); }
-	void init(JSContext*, const Handle<T>& x) { h = x.get(); }
-	PersistentRooted& operator=(const T& x) { h = x; return *this; }
-	PersistentRooted& operator=(const Handle<T>& x) { h = x.get(); return *this; }
-	const T& get() const { return h.get(); }
-	const T* address() const { return h.address(); }
-	operator const T&() const { return h.get(); }
-	auto operator->() const { if constexpr (std::is_pointer_v<T>) return h.get(); else return &h.get(); }
+	template<typename U, typename = std::enable_if_t<std::is_convertible_v<const U&, T>>>
+	void init(JSContext*, const U& x) { dirty = false; h = static_cast<const T&>(x); }
+	template<typename U, typename = std::enable_if_t<std::is_convertible_v<const U&, T>>>
+	PersistentRooted& operator=(const U& x) { dirty = false; h = static_cast<const T&>(x); return *this; }
+	PersistentRooted& operator=(const PersistentRooted& o) { dirty = false; h = o.get(); return *this; }
+	template<typename U, typename = std::enable_if_t<std::is_convertible_v<const U&, T>>>
+	void set(const U& x) { dirty = false; h = static_cast<const T&>(x); }
+	void sync() override { if (dirty) { h = tmp; dirty = false; } }
+	MutableHandle<T> operator&() {
+		if (!dirty) { tmp = h.get(); dirty = true; }
+		if (!registered_) JSShim_RegisterDirty(this);
+		return MutableHandle<T>(&tmp);
+	}
+	const T& get() const { const_cast<PersistentRooted*>(this)->sync(); return h.get(); }
+	const T* address() const { return &get(); }
+	operator const T&() const { return get(); }
+	auto operator->() const { if constexpr (std::is_pointer_v<T>) return get(); else return &get(); }
 	bool initialized() const { return true; }
-	void reset() { h = T(); }
+	void reset() { dirty = false; h = T(); }
 };
 
 using RootedValue = Rooted<Value>;
@@ -185,6 +215,7 @@ using HandleString = Handle<JSString*>;
 using HandleId = Handle<PropertyKey>;
 using MutableHandleValue = MutableHandle<Value>;
 using MutableHandleObject = MutableHandle<JSObject*>;
+using MutableHandleString = MutableHandle<JSString*>;
 using MutableHandleId = MutableHandle<PropertyKey>;
 using PersistentRootedValue = PersistentRooted<Value>;
 using PersistentRootedObject = PersistentRooted<JSObject*>;

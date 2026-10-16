@@ -3,6 +3,9 @@
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <memory>
+#include <mutex>
+#include <set>
 
 namespace JS {
 const Value UndefinedHandleValueStorage;
@@ -74,7 +77,16 @@ JSValue NewNative(JSContext* cx, JSNative call, unsigned nargs, const char* name
 } // namespace
 
 JSShimCtx& JSShim_Ctx(JSContext*) { return t_ctx; }
+namespace { void ClearStrKeep(); }
+namespace { thread_local std::vector<JS::PersistentSyncBase*> t_dirty; }
+void JS::JSShim_RegisterDirty(JS::PersistentSyncBase* p) { p->registered_ = true; t_dirty.push_back(p); }
+void JS::JSShim_UnregisterDirty(JS::PersistentSyncBase* p) {
+	p->registered_ = false; for (size_t i = 0; i < t_dirty.size(); i++) if (t_dirty[i] == p) { t_dirty.erase(t_dirty.begin() + i); break; }
+}
 void JSShim_PoolRelease(JSContext* cx, size_t keep) {
+	for (auto* p : t_dirty) { p->sync(); p->registered_ = false; }
+	t_dirty.clear();
+	ClearStrKeep();
 	auto& p = t_ctx.pool;
 	while (p.size() > keep) { JS_FreeValue(cx, p.back()); p.pop_back(); }
 }
@@ -395,25 +407,30 @@ void JS_SetGCParameter(JSContext* cx, JSGCParamKey key, uint32_t value) {
 
 // ---- Classes ----
 namespace {
+std::mutex& ClassMutex();
 std::map<const JSClass*, JSClassID>& ClassIds() { static std::map<const JSClass*, JSClassID> m; return m; }
 std::map<JSClassID, const JSClass*>& ClassById() { static std::map<JSClassID, const JSClass*> m; return m; }
+struct ProxyData { const js::BaseProxyHandler* handler; JSValue priv; JSValue slots[2]; };
+std::set<JSClassID>& ProxyClasses() { static std::set<JSClassID> s; return s; }
 void Finalizer(JSRuntime*, JSValue v) {
 	JSClassID id = JS_GetClassID(v);
-	auto it = ClassById().find(id);
-	if (it != ClassById().end() && it->second->cOps && it->second->cOps->finalize)
-		it->second->cOps->finalize(nullptr, (JSObject*)JS_VALUE_GET_PTR(v));
+	const JSClass* c = nullptr;
+	{ std::lock_guard<std::mutex> lock(ClassMutex()); auto it = ClassById().find(id); if (it != ClassById().end()) c = it->second; }
+	if (c && c->cOps && c->cOps->finalize) c->cOps->finalize(nullptr, (JSObject*)JS_VALUE_GET_PTR(v));
+	if (c && ProxyClasses().count(id)) delete (ProxyData*)JS_GetOpaque(v, id);
 }
+std::mutex& ClassMutex() { static std::mutex m; return m; }
+JSClassDef MakeDef(const JSClass* clasp);
 JSClassID EnsureClass(JSContext* cx, const JSClass* clasp) {
+	// Class ids are global, but a class has to be registered in every runtime that uses it.
+	std::lock_guard<std::mutex> lock(ClassMutex());
 	auto& ids = ClassIds();
+	JSRuntime* rt = JS_GetRuntime(cx);
 	auto it = ids.find(clasp);
-	if (it != ids.end()) {
-		if (!JS_IsRegisteredClass(JS_GetRuntime(cx), it->second)) {} // same runtime only
-		return it->second;
-	}
-	JSClassID id = 0; JS_NewClassID(JS_GetRuntime(cx), &id);
-	JSClassDef def = {}; def.class_name = clasp->name; def.finalizer = Finalizer;
-	JS_NewClass(JS_GetRuntime(cx), id, &def);
-	ids[clasp] = id; ClassById()[id] = clasp;
+	JSClassID id = 0;
+	if (it != ids.end()) id = it->second;
+	else { JS_NewClassID(rt, &id); ids[clasp] = id; ClassById()[id] = clasp; }
+	if (!JS_IsRegisteredClass(rt, id)) { JSClassDef def = MakeDef(clasp); JS_NewClass(rt, id, &def); }
 	return id;
 }
 } // namespace
@@ -437,8 +454,26 @@ void* JS_GetInstancePrivate(JSContext* cx, JS::HandleObject obj, const JSClass* 
 bool JS_InstanceOf(JSContext* cx, JS::HandleObject obj, const JSClass* clasp, JS::CallArgs*) { return JSShim_IsInstance(cx, obj.get(), clasp); }
 void* JS_GetPrivate(JSObject* obj) { return JS_GetOpaque(VO(obj), JS_GetClassID(VO(obj))); }
 void JS_SetPrivate(JSObject* obj, void* data) { JS_SetOpaque(VO(obj), data); }
+namespace {
+JSClass g_cObject{"Object", 0, nullptr, nullptr, nullptr, nullptr, JSProto_Object};
+JSClass g_cArray{"Array", 0, nullptr, nullptr, nullptr, nullptr, JSProto_Array};
+JSClass g_cString{"String", 0, nullptr, nullptr, nullptr, nullptr, JSProto_String};
+JSClass g_cNumber{"Number", 0, nullptr, nullptr, nullptr, nullptr, JSProto_Number};
+JSClass g_cBoolean{"Boolean", 0, nullptr, nullptr, nullptr, nullptr, JSProto_Boolean};
+JSClass g_cOther{"Other", 0, nullptr, nullptr, nullptr, nullptr, 0};
+}
 const JSClass* JS_GetClass(JSObject* obj) {
-	auto it = ClassById().find(JS_GetClassID(VO(obj))); return it == ClassById().end() ? nullptr : it->second;
+	JSClassID id = JS_GetClassID(VO(obj));
+	{ std::lock_guard<std::mutex> lock(ClassMutex()); auto it = ClassById().find(id); if (it != ClassById().end()) return it->second; }
+	static thread_local bool probed = false;
+	static thread_local JSClassID idObj, idArr, idStr, idNum, idBool;
+	if (!probed) {
+		JSContext* cx = t_globalCx; probed = true;
+		auto probe = [&](const char* code) { JSValue v = JS_Eval(cx, code, strlen(code), "<probe>", 0); JSClassID c = JS_GetClassID(v); JS_FreeValue(cx, v); return c; };
+		idObj = probe("({})"); idArr = probe("[]"); idStr = probe("new String('')"); idNum = probe("new Number(0)"); idBool = probe("new Boolean(false)");
+	}
+	if (id == idObj) return &g_cObject; if (id == idArr) return &g_cArray; if (id == idStr) return &g_cString;
+	if (id == idNum) return &g_cNumber; if (id == idBool) return &g_cBoolean; return &g_cOther;
 }
 JSObject* JS_InitClass(JSContext* cx, JS::HandleObject obj, JS::HandleObject parent_proto, const JSClass* clasp,
 	JSNative constructor, unsigned nargs, const JSPropertySpec* ps, const JSFunctionSpec* fs,
@@ -524,3 +559,244 @@ bool JS_Init() { return true; }
 void JS_ShutDown() {}
 
 JS::PropertyKey INT_TO_JSID(int i) { return JS::PropertyKey(JS_NewAtomUInt32(t_globalCx, (uint32_t)i)); }
+
+// ======== Batch implementations ========
+JSType JS_TypeOfValue(JSContext* cx, JS::HandleValue v) {
+	if (v.isUndefined()) return JSTYPE_UNDEFINED; if (v.isNull()) return JSTYPE_NULL;
+	if (v.isBoolean()) return JSTYPE_BOOLEAN; if (v.isNumber()) return JSTYPE_NUMBER;
+	if (v.isString()) return JSTYPE_STRING; if (v.isSymbol()) return JSTYPE_SYMBOL;
+	if (JS_IsFunction(cx, V(v.get()))) return JSTYPE_FUNCTION;
+	return JSTYPE_OBJECT;
+}
+int64_t JS_Now() {
+	return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
+namespace { JSInterruptCallback t_interruptCb = nullptr;
+int InterruptThunk(JSRuntime*, void*) { return t_interruptCb && t_globalCx ? (t_interruptCb(t_globalCx) ? 0 : 1) : 0; } }
+bool JS_AddInterruptCallback(JSContext* cx, JSInterruptCallback cb) {
+	t_interruptCb = cb; JS_SetInterruptHandler(JS_GetRuntime(cx), cb ? InterruptThunk : nullptr, nullptr); return true;
+}
+namespace { thread_local std::vector<std::unique_ptr<std::u16string>> t_strKeep; void ClearStrKeep() { t_strKeep.clear(); } }
+const char16_t* JS_GetTwoByteStringCharsAndLength(JSContext* cx, const JS::AutoCheckCannotGC&, JSString* str, size_t* length) {
+	t_strKeep.push_back(std::make_unique<std::u16string>(JSShim_StringToUTF16(cx, str)));
+	*length = t_strKeep.back()->size(); return t_strKeep.back()->data();
+}
+JSString* JS_NewStringCopyUTF8Z(JSContext* cx, const JS::ConstUTF8CharsZ& s) { return JS_NewStringCopyN(cx, s.p, s.n); }
+JSString* JS_AtomizeAndPinUCStringN(JSContext* cx, const char16_t* chars, size_t length) { return JS_NewUCStringCopyN(cx, chars, length); }
+
+JSObject* JS_NewUint8Array(JSContext* cx, size_t length) {
+	JSValue n = JS_NewInt64(cx, (int64_t)length);
+	JSValue r = JS_NewTypedArray(cx, 1, &n, JS_TYPED_ARRAY_UINT8); return PooledObj(cx, r);
+}
+JSObject* JS_NewUint16Array(JSContext* cx, size_t length) {
+	JSValue n = JS_NewInt64(cx, (int64_t)length);
+	JSValue r = JS_NewTypedArray(cx, 1, &n, JS_TYPED_ARRAY_UINT16); return PooledObj(cx, r);
+}
+namespace {
+uint8_t* TAData(JSObject* obj, size_t* len) {
+	JSContext* cx = t_globalCx; size_t off, blen, bpe;
+	JSValue buf = JS_GetTypedArrayBuffer(cx, VO(obj), &off, &blen, &bpe);
+	if (JS_IsException(buf)) return nullptr;
+	size_t sz; uint8_t* p = JS_GetArrayBuffer(cx, &sz, buf); JS_FreeValue(cx, buf);
+	if (len) *len = blen / (bpe ? bpe : 1);
+	return p ? p + off : nullptr;
+}
+}
+uint8_t* JS_GetUint8ArrayData(JSObject* obj, bool* sh, const JS::AutoCheckCannotGC&) { if (sh) *sh = false; return TAData(obj, nullptr); }
+uint16_t* JS_GetUint16ArrayData(JSObject* obj, bool* sh, const JS::AutoCheckCannotGC&) { if (sh) *sh = false; return (uint16_t*)TAData(obj, nullptr); }
+size_t JS_GetTypedArrayLength(JSObject* obj) { size_t n = 0; TAData(obj, &n); return n; }
+size_t JS_GetTypedArrayByteOffset(JSObject* obj) {
+	size_t off, blen, bpe; JSValue buf = JS_GetTypedArrayBuffer(t_globalCx, VO(obj), &off, &blen, &bpe);
+	JS_FreeValue(t_globalCx, buf); return off;
+}
+js::Scalar::Type JS_GetArrayBufferViewType(JSObject* obj) {
+	switch (JS_GetTypedArrayType(VO(obj))) {
+	case JS_TYPED_ARRAY_UINT8C: return js::Scalar::Uint8Clamped; case JS_TYPED_ARRAY_INT8: return js::Scalar::Int8;
+	case JS_TYPED_ARRAY_UINT8: return js::Scalar::Uint8; case JS_TYPED_ARRAY_INT16: return js::Scalar::Int16;
+	case JS_TYPED_ARRAY_UINT16: return js::Scalar::Uint16; case JS_TYPED_ARRAY_INT32: return js::Scalar::Int32;
+	case JS_TYPED_ARRAY_UINT32: return js::Scalar::Uint32; case JS_TYPED_ARRAY_FLOAT32: return js::Scalar::Float32;
+	case JS_TYPED_ARRAY_FLOAT64: return js::Scalar::Float64; default: return js::Scalar::MaxTypedArrayViewType; }
+}
+JSObject* JS_GetArrayBufferViewBuffer(JSContext* cx, JS::HandleObject obj, bool* sh) {
+	if (sh) *sh = false; size_t off, blen, bpe;
+	return PooledObj(cx, JS_GetTypedArrayBuffer(cx, VO(obj), &off, &blen, &bpe));
+}
+bool JS::IsArrayBufferObject(JSObject* obj) { return obj && JS_IsArrayBuffer(VO(obj)); }
+uint8_t* JS::GetArrayBufferData(JSObject* obj, bool* sh, const AutoCheckCannotGC&) { if (sh) *sh = false; size_t n; return JS_GetArrayBuffer(t_globalCx, &n, VO(obj)); }
+size_t JS::GetArrayBufferByteLength(JSObject* obj) { size_t n = 0; JS_GetArrayBuffer(t_globalCx, &n, VO(obj)); return n; }
+JSObject* JS::NewArrayBufferWithContents(JSContext* cx, size_t nbytes, void* contents) {
+	JSValue r = JS_NewArrayBufferCopy(cx, (const uint8_t*)contents, nbytes); free(contents); return PooledObj(cx, r);
+}
+JSObject* JSShim_NewTypedArrayWithBuffer(JSContext* cx, int type, JS::HandleObject buffer, size_t byteOffset, int64_t length) {
+	JSValue a[3] = { VO(buffer), JS_NewInt64(cx, (int64_t)byteOffset), JS_NewInt64(cx, length) };
+	return PooledObj(cx, JS_NewTypedArray(cx, 3, a, (JSTypedArrayEnum)type));
+}
+
+// ======== Proxy objects ========
+namespace {
+ProxyData* PD(JSValueConst obj) { return (ProxyData*)JS_GetOpaque(obj, JS_GetClassID(obj)); }
+JSObject* PObj(JSValueConst o) { return (JSObject*)JS_VALUE_GET_PTR(o); }
+
+JSValue px_get(JSContext* cx, JSValueConst obj, JSAtom atom, JSValueConst receiver) {
+	ProxyData* d = PD(obj); if (!d) return JS_UNDEFINED;
+	JS::RootedObject proxy(cx, PObj(obj)); JS::RootedValue recv(cx, JS::Value(receiver)), vp(cx); JS::RootedId id(cx, JS::PropertyKey(atom));
+	JSShim_RequestEnter();
+	bool ok = d->handler->get(cx, proxy, recv, id, &vp);
+	JSValue r = ok ? JS_DupValue(cx, vp.get().raw()) : JS_EXCEPTION;
+	JSShim_RequestLeave(cx);
+	if (!ok && !JS_HasException(cx)) JS_ThrowInternalError(cx, "GUI proxy get failed");
+	return r;
+}
+int px_set(JSContext* cx, JSValueConst obj, JSAtom atom, JSValueConst value, JSValueConst receiver, int flags) {
+	ProxyData* d = PD(obj); if (!d) return 0;
+	JS::RootedObject proxy(cx, PObj(obj)); JS::RootedValue v(cx, JS::Value(value)), recv(cx, JS::Value(receiver)); JS::RootedId id(cx, JS::PropertyKey(atom));
+	JS::ObjectOpResult res;
+	JSShim_RequestEnter();
+	bool ok = d->handler->set(cx, proxy, id, v, recv, res);
+	JSShim_RequestLeave(cx);
+	if (!ok) { if (!JS_HasException(cx)) JS_ThrowInternalError(cx, "GUI proxy set failed"); return -1; }
+	if (!res.ok() && !JS_HasException(cx) && (flags & (JS_PROP_THROW | JS_PROP_THROW_STRICT)))
+		JS_ThrowTypeError(cx, "cannot set property on GUI object");
+	return res.ok() ? 1 : (JS_HasException(cx) ? -1 : 0);
+}
+int px_delete(JSContext* cx, JSValueConst obj, JSAtom atom) {
+	ProxyData* d = PD(obj); if (!d) return 0;
+	JS::RootedObject proxy(cx, PObj(obj)); JS::RootedId id(cx, JS::PropertyKey(atom)); JS::ObjectOpResult res;
+	JSShim_RequestEnter();
+	bool ok = d->handler->delete_(cx, proxy, id, res);
+	JSShim_RequestLeave(cx);
+	if (!ok) return -1;
+	return res.ok() ? 1 : 0;
+}
+int px_get_own_property(JSContext*, JSPropertyDescriptor*, JSValueConst, JSAtom) { return 0; }
+int px_has_property(JSContext*, JSValueConst, JSAtom) { return 0; }
+JSClassExoticMethods g_exotic = { px_get_own_property, nullptr, px_delete, nullptr, px_has_property, px_get, px_set };
+JSClassDef MakeDef(const JSClass* clasp) {
+	JSClassDef def = {}; def.class_name = clasp->name; def.finalizer = Finalizer;
+	return def;
+}
+} // namespace
+
+JSObject* js::NewProxyObject(JSContext* cx, const BaseProxyHandler* handler, JS::HandleValue priv, JSObject*, const ProxyOptions& options) {
+	// Proxy classes are registered like ordinary classes, then given exotic behaviour via a dedicated def.
+	JSClassID id;
+	{
+		std::lock_guard<std::mutex> lock(ClassMutex());
+		auto& ids = ClassIds(); JSRuntime* rt = JS_GetRuntime(cx);
+		auto it = ids.find(options.clasp);
+		if (it != ids.end()) id = it->second; else { id = 0; JS_NewClassID(rt, &id); ids[options.clasp] = id; ClassById()[id] = options.clasp; }
+		ProxyClasses().insert(id);
+		if (!JS_IsRegisteredClass(rt, id)) { JSClassDef def = MakeDef(options.clasp); def.exotic = &g_exotic; JS_NewClass(rt, id, &def); }
+	}
+	JSValue o = JS_NewObjectClass(cx, (int)id);
+	if (JS_IsException(o)) return nullptr;
+	ProxyData* d = new ProxyData{ handler, priv.get().raw(), { JS_UNDEFINED, JS_UNDEFINED } };
+	JS_SetOpaque(o, d);
+	return PooledObj(cx, o);
+}
+JS::Value js::GetProxyPrivate(const JSObject* obj) { return JS::Value(PD(JS::Conv<JSObject*>::to(const_cast<JSObject*>(obj)))->priv); }
+JS::Value js::GetProxyReservedSlot(const JSObject* obj, size_t slot) { return JS::Value(PD(JS::Conv<JSObject*>::to(const_cast<JSObject*>(obj)))->slots[slot]); }
+void js::SetProxyReservedSlot(JSObject* obj, size_t slot, const JS::Value& v) { PD(JS::Conv<JSObject*>::to(obj))->slots[slot] = v.raw(); }
+
+// ======== Collections, iteration, promises ========
+namespace {
+bool CallMethod(JSContext* cx, JSValueConst obj, const char* name, int argc, JSValueConst* argv, JSValue* out) {
+	JSValue r = JS_Invoke(cx, obj, JS_NewAtom(cx, name), argc, argv);
+	if (JS_IsException(r)) return false;
+	if (out) *out = r; else JS_FreeValue(cx, r);
+	return true;
+}
+bool InstanceOfGlobal(JSContext* cx, JSObject* obj, const char* ctorName) {
+	JSValue g = JS_GetGlobalObject(cx); JSValue c = JS_GetPropertyStr(cx, g, ctorName);
+	int r = JS_IsInstanceOf(cx, VO(obj), c); JS_FreeValue(cx, c); JS_FreeValue(cx, g); return r > 0;
+}
+uint32_t SizeOf(JSContext* cx, JSObject* obj) {
+	JSValue sz = JS_GetPropertyStr(cx, VO(obj), "size"); uint32_t n = 0; JS_ToUint32(cx, &n, sz); JS_FreeValue(cx, sz); return n;
+}
+JSObject* NewGlobalCtor(JSContext* cx, const char* name) {
+	JSValue g = JS_GetGlobalObject(cx); JSValue c = JS_GetPropertyStr(cx, g, name);
+	JSValue o = JS_CallConstructor(cx, c, 0, nullptr); JS_FreeValue(cx, c); JS_FreeValue(cx, g); return PooledObj(cx, o);
+}
+std::map<JSObject*, std::pair<JSValue, JSValue>>& PromiseFuncs() { static thread_local std::map<JSObject*, std::pair<JSValue, JSValue>> m; return m; }
+}
+bool JS::IsArray(JSContext*, HandleObject obj, bool* r) { *r = obj.get() && JS_IsArray(VO(obj)); return true; }
+bool JS::IsMapObject(JSContext* cx, HandleObject obj, bool* r) { *r = obj.get() && InstanceOfGlobal(cx, obj.get(), "Map"); return true; }
+bool JS::IsSetObject(JSContext* cx, HandleObject obj, bool* r) { *r = obj.get() && InstanceOfGlobal(cx, obj.get(), "Set"); return true; }
+uint32_t JS::MapSize(JSContext* cx, HandleObject obj) { return SizeOf(cx, obj.get()); }
+uint32_t JS::SetSize(JSContext* cx, HandleObject obj) { return SizeOf(cx, obj.get()); }
+bool JS::MapEntries(JSContext* cx, HandleObject obj, MutableHandleValue rval) {
+	JSValue r; if (!CallMethod(cx, VO(obj), "entries", 0, nullptr, &r)) return false; rval.set(Pooled(cx, r)); return true;
+}
+bool JS::SetValues(JSContext* cx, HandleObject obj, MutableHandleValue rval) {
+	JSValue r; if (!CallMethod(cx, VO(obj), "values", 0, nullptr, &r)) return false; rval.set(Pooled(cx, r)); return true;
+}
+JSObject* JS::NewMapObject(JSContext* cx) { return NewGlobalCtor(cx, "Map"); }
+JSObject* JS::NewSetObject(JSContext* cx) { return NewGlobalCtor(cx, "Set"); }
+bool JS::MapSet(JSContext* cx, HandleObject obj, HandleValue key, HandleValue val) {
+	JSValue a[2] = { V(key.get()), V(val.get()) }; return CallMethod(cx, VO(obj), "set", 2, a, nullptr);
+}
+bool JS::SetAdd(JSContext* cx, HandleObject obj, HandleValue key) { JSValue a[1] = { V(key.get()) }; return CallMethod(cx, VO(obj), "add", 1, a, nullptr); }
+
+bool JS::ForOfIterator::init(HandleValue iterable, NonIterableBehavior) {
+	JSValue symIter; { JSValue g = JS_GetGlobalObject(cx); JSValue S = JS_GetPropertyStr(cx, g, "Symbol"); symIter = JS_GetPropertyStr(cx, S, "iterator"); JS_FreeValue(cx, S); JS_FreeValue(cx, g); }
+	JSAtom a = JS_ValueToAtom(cx, symIter); JS_FreeValue(cx, symIter);
+	JSValue fn = JS_GetProperty(cx, V(iterable.get()), a); JS_FreeAtom(cx, a);
+	if (JS_IsException(fn)) return false;
+	JSValue it = JS_Call(cx, fn, V(iterable.get()), 0, nullptr); JS_FreeValue(cx, fn);
+	if (JS_IsException(it)) return false;
+	iterator = Pooled(cx, it); return true;
+}
+bool JS::ForOfIterator::next(MutableHandleValue val, bool* done) {
+	JSValue r; if (!CallMethod(cx, V(iterator), "next", 0, nullptr, &r)) return false;
+	Value rv = Pooled(cx, r);
+	JSValue d = JS_GetPropertyStr(cx, r, "done"); *done = JS_ToBool(cx, d) > 0; JS_FreeValue(cx, d);
+	JSValue v = JS_GetPropertyStr(cx, r, "value"); val.set(Pooled(cx, v)); return true;
+}
+JSObject* JS::NewPromiseObject(JSContext* cx, HandleObject) {
+	JSValue funcs[2]; JSValue p = JS_NewPromiseCapability(cx, funcs);
+	if (JS_IsException(p)) return nullptr;
+	JSObject* po = PooledObj(cx, p);
+	PromiseFuncs()[po] = { funcs[0], funcs[1] };
+	return po;
+}
+bool JS::ResolvePromise(JSContext* cx, HandleObject promise, HandleValue v) {
+	auto it = PromiseFuncs().find(promise.get()); if (it == PromiseFuncs().end()) return false;
+	JSValue a = V(v.get()); JSValue r = JS_Call(cx, it->second.first, JS_UNDEFINED, 1, &a);
+	JS_FreeValue(cx, r); JS_FreeValue(cx, it->second.first); JS_FreeValue(cx, it->second.second); PromiseFuncs().erase(it); return true;
+}
+bool JS::RejectPromise(JSContext* cx, HandleObject promise, HandleValue v) {
+	auto it = PromiseFuncs().find(promise.get()); if (it == PromiseFuncs().end()) return false;
+	JSValue a = V(v.get()); JSValue r = JS_Call(cx, it->second.second, JS_UNDEFINED, 1, &a);
+	JS_FreeValue(cx, r); JS_FreeValue(cx, it->second.first); JS_FreeValue(cx, it->second.second); PromiseFuncs().erase(it); return true;
+}
+
+bool JS_Enumerate(JSContext* cx, JS::HandleObject obj, JS::MutableHandle<JS::IdVector> props) {
+	JSPropertyEnum* tab; uint32_t n;
+	if (JS_GetOwnPropertyNames(cx, &tab, &n, VO(obj), JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) < 0) return false;
+	for (uint32_t i = 0; i < n; i++) props.get().push_back(JS::PropertyKey(JS_DupAtom(cx, tab[i].atom)));
+	JS_FreePropertyEnum(cx, tab, n); return true;
+}
+bool JS_GetPropertyDescriptorById(JSContext* cx, JS::HandleObject obj, JS::HandleId id,
+	JS::MutableHandle<mozilla::Maybe<JS::PropertyDescriptor>> desc, JS::MutableHandleObject holder) {
+	JSValue cur = JS_DupValue(cx, VO(obj));
+	while (JS_IsObject(cur)) {
+		JSPropertyDescriptor d; int r = JS_GetOwnProperty(cx, &d, cur, id->atom);
+		if (r < 0) { JS_FreeValue(cx, cur); return false; }
+		if (r > 0) {
+			JS::PropertyDescriptor pd; pd.value = JS::Value(d.value); 
+			pd.attrs = ((d.flags & JS_PROP_WRITABLE) ? 0 : JSPROP_READONLY) | ((d.flags & JS_PROP_ENUMERABLE) ? JSPROP_ENUMERATE : 0) | ((d.flags & JS_PROP_CONFIGURABLE) ? 0 : JSPROP_PERMANENT);
+			pd.hasGetter_ = !JS_IsUndefined(d.getter); pd.hasSetter_ = !JS_IsUndefined(d.setter);
+			JS_FreeValue(cx, d.getter); JS_FreeValue(cx, d.setter); JS_FreeValue(cx, d.value);
+			desc.get().emplace(pd); holder.set(PooledObj(cx, cur)); return true;
+		}
+		JSValue p = JS_GetPrototype(cx, cur); JS_FreeValue(cx, cur); cur = p;
+	}
+	JS_FreeValue(cx, cur); desc.get().reset(); return true;
+}
+
+JSFunction* JS_ValueToFunction(JSContext* cx, JS::HandleValue v) { return (v.isObject() && JS_IsFunction(cx, V(v.get()))) ? v.toObjectOrNull() : nullptr; }
+JSString* JS_GetFunctionId(JSFunction* fun) {
+	JSContext* cx = t_globalCx; JSValue n = JS_GetPropertyStr(cx, VO(fun), "name");
+	if (!JS_IsString(n)) { JS_FreeValue(cx, n); return nullptr; }
+	return JS::Conv<JSString*>::from(Pooled(cx, n).raw());
+}
