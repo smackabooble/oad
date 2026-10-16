@@ -14,6 +14,7 @@ const Value FalseHandleValueStorage(JS_FALSE);
 namespace {
 thread_local JSShimCtx t_ctx;
 thread_local JSContext* t_globalCx = nullptr;
+thread_local JSRuntime* t_globalRt = nullptr;
 using JS::Value;
 
 inline size_t JSShim_StrLen(JSValue s) {
@@ -77,8 +78,8 @@ void JSShim_PoolRelease(JSContext* cx, size_t keep) {
 	auto& p = t_ctx.pool;
 	while (p.size() > keep) { JS_FreeValue(cx, p.back()); p.pop_back(); }
 }
-JSContext* JS::JSShim_GlobalCx() { return t_globalCx; }
-void JSShim_SetGlobalCx(JSContext* cx) { t_globalCx = cx; }
+JSRuntime* JS::JSShim_GlobalRt() { return t_globalRt; }
+void JSShim_SetGlobalCx(JSContext* cx) { t_globalCx = cx; t_globalRt = cx ? JS_GetRuntime(cx) : nullptr; }
 
 // ---- objects ----
 JSObject* JS_NewPlainObject(JSContext* cx) { return PooledObj(cx, JS_NewObject(cx)); }
@@ -459,3 +460,67 @@ JSObject* JS_InitClass(JSContext* cx, JS::HandleObject obj, JS::HandleObject par
 	return protoObj.get();
 }
 JSObject* JS_GetClassObject(JSContext*, JSProtoKey, JS::MutableHandleObject objp) { objp.set(nullptr); return nullptr; }
+
+std::wstring JSShim_StringToWString(JSContext* cx, JSString* str) {
+	std::string u = JSShim_StringToUTF8(cx, str);
+	std::wstring out; out.reserve(u.size());
+	for (size_t i = 0; i < u.size();) {
+		unsigned char c = u[i]; uint32_t cp; int n;
+		if (c < 0x80) { cp = c; n = 1; } else if (c < 0xE0) { cp = c & 0x1F; n = 2; } else if (c < 0xF0) { cp = c & 0x0F; n = 3; } else { cp = c & 0x07; n = 4; }
+		for (int k = 1; k < n && i + k < u.size(); k++) cp = (cp << 6) | (u[i + k] & 0x3F);
+		i += n; out.push_back((wchar_t)cp);
+	}
+	return out;
+}
+
+// ---- Script compilation / evaluation ----
+namespace {
+JSValue EvalSrc(JSContext* cx, const char* code, size_t len, const char* file, bool strict) {
+	std::string copy(code, len);
+	return JS_Eval(cx, copy.c_str(), copy.size(), file, JS_EVAL_TYPE_GLOBAL | (strict ? JS_EVAL_FLAG_STRICT : 0));
+}
+thread_local int t_depth = 0;
+}
+bool JS::Evaluate(JSContext* cx, const CompileOptions& opts, const SourceText<mozilla::Utf8Unit>& src, MutableHandleValue rval) {
+	JSValue r = EvalSrc(cx, src.data(), src.length(), opts.file, true);
+	if (JS_IsException(r)) return false;
+	rval.set(Pooled(cx, r)); return true;
+}
+JSFunction* JS::CompileFunction(JSContext* cx, RootedObjectVector&, const CompileOptions& opts, const char*, unsigned,
+	const char* const*, const SourceText<mozilla::Utf8Unit>& src) {
+	// Wrap on the first line so reported line numbers stay correct.
+	std::string code = "(function() {" + std::string(src.data(), src.length()) + "\n})";
+	JSValue r = EvalSrc(cx, code.data(), code.size(), opts.file, true);
+	if (JS_IsException(r)) return nullptr;
+	return PooledObj(cx, r);
+}
+bool JS_CallFunction(JSContext* cx, JS::HandleObject thisObj, JS::HandleObject fun, const JS::HandleValueArray& args, JS::MutableHandleValue rval) {
+	std::vector<JSValue> a; for (size_t i = 0; i < args.length(); i++) a.push_back(args.begin()[i].raw());
+	JSValue r = JS_Call(cx, VO(fun), thisObj.get() ? VO(thisObj) : JS_UNDEFINED, (int)a.size(), a.data());
+	if (JS_IsException(r)) return false; rval.set(Pooled(cx, r)); return true;
+}
+JSObject* JSShim_GlobalObject(JSContext* cx) { return PooledObj(cx, JS_GetGlobalObject(cx)); }
+bool JSShim_GetOwnPropFlags(JSContext* cx, JSObject* obj, const char* name, bool* found, bool* writable, bool* configurable) {
+	Atom a(cx, name); JSPropertyDescriptor d;
+	int r = JS_GetOwnProperty(cx, &d, VO(obj), a.a);
+	if (r < 0) return false;
+	*found = r > 0;
+	if (r > 0) {
+		*writable = (d.flags & JS_PROP_WRITABLE) || (d.flags & JS_PROP_GETSET);
+		*configurable = d.flags & JS_PROP_CONFIGURABLE;
+		JS_FreeValue(cx, d.value); JS_FreeValue(cx, d.getter); JS_FreeValue(cx, d.setter);
+	}
+	return true;
+}
+bool JSShim_EvalGlobalName(JSContext* cx, const char* name, JS::MutableHandleValue out) {
+	// Resolves script-level let/const/class bindings, which live outside the global object.
+	JSValue r = JS_Eval(cx, name, strlen(name), "<global>", JS_EVAL_TYPE_GLOBAL);
+	if (JS_IsException(r)) { JS_FreeValue(cx, JS_GetException(cx)); out.set(JS::UndefinedValue()); return true; }
+	out.set(Pooled(cx, r)); return true;
+}
+void JSShim_RequestEnter() { t_depth++; }
+void JSShim_RequestLeave(JSContext* cx) { if (--t_depth == 0) JSShim_PoolRelease(cx); }
+bool JS_Init() { return true; }
+void JS_ShutDown() {}
+
+JS::PropertyKey INT_TO_JSID(int i) { return JS::PropertyKey(JS_NewAtomUInt32(t_globalCx, (uint32_t)i)); }

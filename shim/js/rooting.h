@@ -28,6 +28,8 @@ template<> struct Conv<PropertyKey> {
 
 template<typename T> class MutableHandle;
 template<typename T> class Rooted;
+template<typename T> class Heap;
+template<typename T> class PersistentRooted;
 
 // Forwarding of Value methods through Handle/Rooted/Heap wrappers (as WrappedPtrOperations in SM).
 #define JSSHIM_VALUE_READ_OPS \
@@ -77,9 +79,11 @@ template<typename T>
 class Handle : public Ops<T, Handle<T>, false> {
 	const T* p;
 public:
-	Handle(const T& ref) : p(&ref) {}
+	constexpr Handle(const T& ref) : p(&ref) {}
 	Handle(const Rooted<T>& r) : p(&r.get()) {}
 	Handle(const MutableHandle<T>& m) : p(&m.get()) {}
+	Handle(const Heap<T>& h) : p(h.address()) {}
+	Handle(const PersistentRooted<T>& r) : p(r.address()) {}
 	const T& get() const { return *p; }
 	operator const T&() const { return *p; }
 	decltype(auto) operator*() const { if constexpr (std::is_pointer_v<T>) return **p; else return (*p); }
@@ -125,15 +129,15 @@ public:
 };
 
 // Owning variants hold a real refcount so they can outlive the request.
-JSContext* JSShim_GlobalCx();
+JSRuntime* JSShim_GlobalRt();
 
 template<typename T>
 class Heap : public Ops<T, Heap<T>, false> {
 	T v{};
-	JSContext* cx = nullptr;
+	JSRuntime* rt = nullptr;
 	static JSValue J(const T& x) { return Conv<T>::to(x); }
-	void acquire() { cx = JSShim_GlobalCx(); if (cx) JS_DupValue(cx, J(v)); }
-	void release() { if (cx) { JS_FreeValue(cx, J(v)); cx = nullptr; } }
+	void acquire() { rt = JSShim_GlobalRt(); if (rt) JS_DupValueRT(rt, J(v)); }
+	void release() { if (rt) { JS_FreeValueRT(rt, J(v)); rt = nullptr; } }
 public:
 	Heap() {}
 	explicit Heap(const T& x) : v(x) { acquire(); }
@@ -159,10 +163,12 @@ public:
 	PersistentRooted(JSContext*, const Handle<T>& x) : h(x.get()) {}
 	void init(JSContext*) {}
 	void init(JSContext*, const T& x) { h = x; }
+	void init(JSContext*, const Rooted<T>& x) { h = x.get(); }
 	void init(JSContext*, const Handle<T>& x) { h = x.get(); }
 	PersistentRooted& operator=(const T& x) { h = x; return *this; }
 	PersistentRooted& operator=(const Handle<T>& x) { h = x.get(); return *this; }
 	const T& get() const { return h.get(); }
+	const T* address() const { return h.address(); }
 	operator const T&() const { return h.get(); }
 	auto operator->() const { if constexpr (std::is_pointer_v<T>) return h.get(); else return &h.get(); }
 	bool initialized() const { return true; }
@@ -184,6 +190,9 @@ using PersistentRootedValue = PersistentRooted<Value>;
 using PersistentRootedObject = PersistentRooted<JSObject*>;
 
 extern const Value UndefinedHandleValueStorage, NullHandleValueStorage, TrueHandleValueStorage, FalseHandleValueStorage;
-inline HandleValue UndefinedHandleValue() { return HandleValue(UndefinedHandleValueStorage); }
+inline const HandleValue UndefinedHandleValue{UndefinedHandleValueStorage};
+inline const HandleValue NullHandleValue{NullHandleValueStorage};
+inline const HandleValue TrueHandleValue{TrueHandleValueStorage};
+inline const HandleValue FalseHandleValue{FalseHandleValueStorage};
 
 } // namespace JS

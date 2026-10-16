@@ -102,7 +102,7 @@ public:
 	operator HandleValueArray() const { return HandleValueArray(size(), data()); }
 };
 using RootedValueVector = RootedVector_;
-using RootedObjectVector = std::vector<JSObject*>;
+class RootedObjectVector : public std::vector<JSObject*> { public: explicit RootedObjectVector(JSContext*) {} };
 
 class ObjectOpResult {
 	bool ok_ = true;
@@ -212,6 +212,7 @@ bool JS_StringHasLatin1Chars(JSString* str);
 size_t JS_GetStringLength(JSString* str);
 std::string JSShim_StringToUTF8(JSContext* cx, JSString* str);
 std::u16string JSShim_StringToUTF16(JSContext* cx, JSString* str);
+std::wstring JSShim_StringToWString(JSContext* cx, JSString* str);
 
 // ---- Exceptions ----
 void JS_ReportErrorUTF8(JSContext* cx, const char* fmt, ...);
@@ -267,3 +268,39 @@ JSObject* JS_InitClass(JSContext* cx, JS::HandleObject obj, JS::HandleObject par
 	JSNative constructor, unsigned nargs, const JSPropertySpec* ps, const JSFunctionSpec* fs,
 	const JSPropertySpec* static_ps, const JSFunctionSpec* static_fs);
 JSObject* JS_GetClassObject(JSContext* cx, JSProtoKey key, JS::MutableHandleObject objp);
+
+// ---- Script compilation / evaluation ----
+namespace mozilla { struct Utf8Unit {}; }
+namespace JS {
+class CompileOptions {
+public:
+	const char* file = "(eval)"; unsigned line = 1;
+	explicit CompileOptions(JSContext*) {}
+	CompileOptions& setFileAndLine(const char* f, unsigned l) { file = f; line = l; return *this; }
+	CompileOptions& setIsRunOnce(bool) { return *this; }
+};
+enum class SourceOwnership { Borrowed, TakeOwnership };
+template<typename Unit> class SourceText {
+	const char* p = nullptr; size_t n = 0;
+public:
+	bool init(JSContext*, const char* c, size_t len, SourceOwnership) { p = c; n = len; return true; }
+	const char* data() const { return p; }
+	size_t length() const { return n; }
+};
+bool Evaluate(JSContext* cx, const CompileOptions& opts, const SourceText<mozilla::Utf8Unit>& src, MutableHandleValue rval);
+JSFunction* CompileFunction(JSContext* cx, RootedObjectVector& scopeChain, const CompileOptions& opts,
+	const char* name, unsigned nargs, const char* const* argnames, const SourceText<mozilla::Utf8Unit>& src);
+}
+bool JS_CallFunction(JSContext* cx, JS::HandleObject thisObj, JS::HandleObject fun, const JS::HandleValueArray& args, JS::MutableHandleValue rval);
+JSObject* JSShim_GlobalObject(JSContext* cx);
+bool JSShim_GetOwnPropFlags(JSContext* cx, JSObject* obj, const char* name, bool* found, bool* writable, bool* configurable);
+bool JSShim_EvalGlobalName(JSContext* cx, const char* name, JS::MutableHandleValue out);
+void JSShim_SetGlobalCx(JSContext* cx);
+// Request nesting (the temp pool is released when the outermost request ends).
+void JSShim_RequestEnter();
+void JSShim_RequestLeave(JSContext* cx);
+
+JS::PropertyKey INT_TO_JSID(int i);
+
+// ---- Structured clone (serialised with QuickJS's object writer) ----
+struct JSStructuredCloneData { std::vector<uint8_t> buf; };
