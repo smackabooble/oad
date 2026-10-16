@@ -20,9 +20,12 @@ Goal: build the real 0 A.D. engine for the browser with Emscripten, replacing Sp
 - **Milestone 2: the real 0 A.D. main menu renders in headless Chromium** (see `web/screenshot-main-menu.png`):
   game thread in a worker (PROXY_TO_PTHREAD + JSPI frame yield), WebGL2 via a patched SDL (`sdl/`),
   game data fetched lazily from zip archives with HTTP Range requests (WasmFS fetch backend).
+- **Milestone 3: an actual match renders and runs in the browser** (`web/screenshot-in-game.png`): terrain, shadows,
+  buildings, units, minimap, HUD. glad regenerated for GLES 3.0, WebGL2 texture/depth formats, framebuffer blit,
+  FCollada linked statically (no dlopen), lobby stubs registered, GLSL ES loop fix.
 - Stubbed for the browser: lobby (gloox), Atlas editor, Vulkan, X11, curl (mod.io / user reports), dir watching, NVTT
   (replaced by an uncompressed-DDS fallback converter), UPnP, audio (not yet).
-- Next: interactivity (mouse/keyboard), start a match, performance, audio, saves/config persistence, packaging.
+- Next: verify input, performance tuning, audio (OpenAL), saves/config persistence (IndexedDB), packaging for the user's own 0 A.D. install.
 
 ## Build
 1. `build/build_deps.sh` builds dependencies (needs emsdk, sources in deps/). SDL needs the patch in `sdl/`.

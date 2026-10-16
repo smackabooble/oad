@@ -1,7 +1,7 @@
 From b21ecae7764929ff18ad687824ad5f29adac69de Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Fri, 16 Oct 2026 10:40:52 +0000
-Subject: [PATCH 6/6] Browser rendering: WebGL2 request, texture fallback
+Subject: [PATCH 6/7] Browser rendering: WebGL2 request, texture fallback
  converter, locale/printf fixes, frame yield, root path
 
 Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>

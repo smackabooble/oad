@@ -25,7 +25,7 @@ gui gui/ObjectTypes gui/ObjectBases gui/Scripting gui/SettingTypes
 lib lib/adts lib/allocators lib/external_libraries lib/file lib/file/archive lib/file/common lib/file/io lib/file/vfs
 lib/posix lib/res lib/res/graphics lib/sysdep lib/tex
 lib/sysdep/os/linux lib/sysdep/os/unix lib/sysdep/rtl/gcc
-rlinterface third_party/mongoose
+rlinterface third_party/mongoose lobby/scripting third_party/encryption
 """.split()
 
 exclude = set(os.environ.get("OAD_EXCLUDE", "lib/sysdep/os/linux/dir_watch_inotify.cpp").split())
@@ -36,6 +36,7 @@ for d in dirs:
         if rel in exclude: continue
         files.append(rel)
 files.append("main.cpp")
+files.append("lobby/Globals.cpp")
 glad = f"{ROOT}/src/libraries/source/glad/src/gles2.cpp"
 extras = [f"{STUBS}/dir_watch_stub.cpp", f"{STUBS}/curl_stub.cpp", f"{STUBS}/wasm_stubs.cpp", f"{STUBS}/wasm_platform.cpp", f"{SRC}/mocks/mocks_real.cpp"]
 
@@ -46,10 +47,29 @@ incs = [SRC, f"{SRC}/pch/engine", SHIM, QJS, STUBS, f"{DEPS}/include", f"{DEPS}/
         f"{SRC}/third_party/tinygettext/include", f"{ROOT}/src/libraries/source/glad/include", f"{ROOT}/src/libraries/source/cxxtest-4.4"]
 cflags = "-std=c++17 -pthread -fwasm-exceptions -O1 -fno-strict-aliasing -Wno-deprecated-declarations -Wno-unused-value " + " ".join(defs) + " " + " ".join(f"-I{i}" for i in incs)
 
+# --- COLLADA converter (FCollada + the game's converter), linked statically (no dlopen in the browser) ---
+import re
+FCOL = f"{ROOT}/src/libraries/source/fcollada"
+fcol_files = []
+mk = open(f"{FCOL}/src/Makefile").read()
+m = re.search(r"SOURCE = \\\n(.*?)\n\n", mk, re.S)
+for line in m.group(1).splitlines():
+    line = line.strip().rstrip("\\").strip()
+    if line.endswith(".cpp"): fcol_files.append(f"{FCOL}/src/{line}")
+col_files = [f for f in sorted(glob.glob(f"{SRC}/collada/*.cpp")) if not f.endswith("precompiled.cpp")]
+xml_inc = f"-I{DEPS}/include/libxml2"
+fcol_flags = ("-std=gnu++14 -pthread -fwasm-exceptions -O1 -w -fno-strict-aliasing -DLINUX -DRETAIL -DNDEBUG "
+              f"-I{FCOL}/src/FCollada -I{FCOL}/include {xml_inc} -I{DEPS}/include")
+col_flags = ("-std=gnu++14 -pthread -fwasm-exceptions -O1 -w -fno-strict-aliasing -DLINUX -DNDEBUG "
+             f"-I{SRC}/collada -I{FCOL}/include -I{FCOL}/src/FCollada {xml_inc} -I{DEPS}/include")
+
 os.makedirs(OUT, exist_ok=True)
 with open(f"{OUT}/build.ninja", "w") as n:
     n.write(f"cflags = {cflags}\n")
     n.write("rule cxx\n  command = em++ $cflags -MMD -MF $out.d -c $in -o $out\n  depfile = $out.d\n  deps = gcc\n  description = CXX $in\n")
+    n.write(f"fcol_flags = {fcol_flags}\ncol_flags = {col_flags}\n")
+    n.write("rule cxx_fcol\n  command = em++ $fcol_flags -MMD -MF $out.d -c $in -o $out\n  depfile = $out.d\n  deps = gcc\n  description = FCOL $in\n")
+    n.write("rule cxx_col\n  command = em++ $col_flags -MMD -MF $out.d -c $in -o $out\n  depfile = $out.d\n  deps = gcc\n  description = COL $in\n")
     n.write("rule ar\n  command = emar rcs $out $in\n  description = AR $out\n\n")
     objs = []
     for rel in files:
@@ -60,6 +80,12 @@ with open(f"{OUT}/build.ninja", "w") as n:
     for e in extras:
         o = "obj/stub__" + os.path.basename(e).replace(".cpp", ".o")
         n.write(f"build {o}: cxx {e}\n"); objs.append(o)
+    for f in fcol_files:
+        o = "obj/fcol__" + os.path.relpath(f, FCOL).replace("/", "__").replace(".cpp", ".o")
+        n.write(f"build {o}: cxx_fcol {f}\n"); objs.append(o)
+    for f in col_files:
+        o = "obj/col__" + os.path.basename(f).replace(".cpp", ".o")
+        n.write(f"build {o}: cxx_col {f}\n"); objs.append(o)
     n.write("build libengine.a: ar " + " ".join(objs) + "\n")
 print(len(files), "source files")
 

@@ -1,7 +1,7 @@
 From 67cb5eb1e53cfea2bd1dd51431e84fbcc079fced Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Fri, 16 Oct 2026 09:53:23 +0000
-Subject: [PATCH 5/6] Browser root path, non-interactive assertions,
+Subject: [PATCH 5/7] Browser root path, non-interactive assertions,
  ToJSVal<Value>, prelude hook
 
 Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>

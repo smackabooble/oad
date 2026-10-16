@@ -2,8 +2,6 @@
 #include "precompiled.h"
 
 #include "lib/sysdep/cpu.h"
-#include "lobby/IXmppClient.h"
-#include "lobby/scripting/JSInterface_Lobby.h"
 #include "ps/GameSetup/Atlas.h"
 #include "ps/DllLoader.h"
 #include "renderer/backend/IDevice.h"
@@ -33,11 +31,6 @@ extern "C" int XInitThreads() { return 1; }
 namespace Renderer { namespace Backend { namespace Vulkan {
 std::unique_ptr<IDevice> CreateDevice(SDL_Window*) { return nullptr; }
 }}}
-
-// ---- Lobby (disabled) ----
-IXmppClient* g_XmppClient = nullptr;
-bool g_rankedGame = false;
-namespace JSI_Lobby { void RegisterScriptFunctions(const ScriptRequest&) {} }
 
 // ---- Atlas editor (not part of the browser build) ----
 GameLoopState* g_AtlasGameLoop = nullptr;

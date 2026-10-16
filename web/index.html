@@ -11,7 +11,8 @@ canvas{display:block;width:100vw;height:100vh;outline:none;background:#000}
 <body><div id="wrap"><canvas id="canvas" tabindex="-1"></canvas></div><pre id="log"></pre>
 <script>
 const logEl = document.getElementById('log');
-function log(t){ console.log(t); logEl.textContent += t + '\n'; logEl.scrollTop = logEl.scrollHeight; }
+const debug = new URLSearchParams(location.search).has('debug');
+function log(t){ console.log(t); if (!debug && !/ERROR|ABORT|WARNING|isolated/i.test(t)) return; logEl.textContent += t + '\n'; logEl.scrollTop = logEl.scrollHeight; }
 if (!window.crossOriginIsolated) log('Not cross-origin isolated: serve this folder with web/server.py (threads need COOP/COEP headers).');
 const canvas = document.getElementById('canvas');
 canvas.addEventListener('webglcontextlost', e => { e.preventDefault(); log('WebGL context lost'); }, false);

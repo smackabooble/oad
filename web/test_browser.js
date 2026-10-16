@@ -10,13 +10,14 @@ const { chromium } = require('/opt/node-tools/node_modules/playwright');
            '--ignore-gpu-blocklist', '--enable-webgl', '--enable-features=SharedArrayBuffer', ...(process.env.JSFLAGS ? ['--js-flags=' + process.env.JSFLAGS] : [])],
   });
   const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
-  page.on('console', m => console.log('[console]', m.text().slice(0, 4000)));
+  const T0 = Date.now(); const ts = () => ((Date.now() - T0) / 1000).toFixed(1).padStart(6) + 's';
+  page.on('console', m => console.log(ts(), '[console]', m.text().slice(0, 4000)));
   page.on('pageerror', e => console.log('[pageerror]', (e.stack || String(e)).slice(0, 4000)));
   page.on('worker', w => console.log('[worker]', w.url().slice(-60)));
   await page.goto(url);
   await page.waitForTimeout(secs * 1000);
   console.log('crossOriginIsolated =', await page.evaluate(() => window.crossOriginIsolated));
-  try { await page.screenshot({ path: shot, timeout: 120000 }); } catch (e) { console.log('screenshot failed:', String(e).slice(0, 200)); }
+  try { await page.screenshot({ path: shot, timeout: 240000 }); } catch (e) { console.log('screenshot failed:', String(e).slice(0, 200)); }
   console.log('screenshot ->', shot);
   await browser.close();
 })();
