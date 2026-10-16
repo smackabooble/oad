@@ -49,7 +49,7 @@ cflags = "-std=c++17 -pthread -fwasm-exceptions -O1 -fno-strict-aliasing -Wno-de
 os.makedirs(OUT, exist_ok=True)
 with open(f"{OUT}/build.ninja", "w") as n:
     n.write(f"cflags = {cflags}\n")
-    n.write("rule cxx\n  command = em++ $cflags -c $in -o $out\n  description = CXX $in\n")
+    n.write("rule cxx\n  command = em++ $cflags -MMD -MF $out.d -c $in -o $out\n  depfile = $out.d\n  deps = gcc\n  description = CXX $in\n")
     n.write("rule ar\n  command = emar rcs $out $in\n  description = AR $out\n\n")
     objs = []
     for rel in files:
@@ -70,7 +70,7 @@ source {ROOT}/emsdk/emsdk_env.sh >/dev/null 2>&1
 P={DEPS}
 OUT=$1; shift
 cd {OUT}
-em++ -O1 -pthread -fwasm-exceptions libengine.a boost_mt/libboost_fs.a $P/lib/libqjs.a -L$P/lib -L$P/lib/static \\
+em++ -O1 -pthread -fwasm-exceptions libengine.a $P/lib/libboost_fs.a $P/lib/libqjs.a -L$P/lib -L$P/lib/static \\
   -lenet -lfmt -lxml2 -lSDL2 -lpng16 -lfreetype -lvorbisfile -lvorbis -logg -lz -licui18n -licuuc -licudata -lsodium \\
   -sUSE_WEBGL2=1 -sFULL_ES3=1 -sALLOW_MEMORY_GROWTH=1 -sSTACK_SIZE=4MB -sINITIAL_MEMORY=512MB -sMAXIMUM_MEMORY=2GB \\
   -sMAX_WEBGL_VERSION=2 -sEXIT_RUNTIME=0 -sPTHREAD_POOL_SIZE=16 -sPTHREAD_POOL_SIZE_STRICT=0 \\

@@ -1,0 +1,90 @@
+From 67cb5eb1e53cfea2bd1dd51431e84fbcc079fced Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 09:53:23 +0000
+Subject: [PATCH 5/5] Browser root path, non-interactive assertions,
+ ToJSVal<Value>, prelude hook
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01V1KTZf1EfjbXMf1biK2Kv5
+---
+ source/lib/debug.cpp                       | 3 ++-
+ source/lib/sysdep/os/unix/unix.cpp         | 2 +-
+ source/ps/GameSetup/Paths.cpp              | 4 ++++
+ source/scriptinterface/ScriptConversions.h | 6 ++++++
+ source/scriptinterface/ScriptInterface.cpp | 1 +
+ 5 files changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/source/lib/debug.cpp b/source/lib/debug.cpp
+index 65cb64ea..3bf9a910 100644
+--- a/source/lib/debug.cpp
++++ b/source/lib/debug.cpp
+@@ -284,7 +284,8 @@ const wchar_t* debug_BuildErrorMessage(
+ 	))
+ 	{
+ fail:
+-		return L"(error while formatting error message)";
++		// Formatting failed; the description alone is still far more useful than nothing.
++		return description;
+ 	}
+ 
+ 	// append stack trace
+diff --git a/source/lib/sysdep/os/unix/unix.cpp b/source/lib/sysdep/os/unix/unix.cpp
+index 501516ec..7fc6b2e9 100644
+--- a/source/lib/sysdep/os/unix/unix.cpp
++++ b/source/lib/sysdep/os/unix/unix.cpp
+@@ -217,7 +217,7 @@ ErrorReactionInternal sys_display_error(const wchar_t* text, size_t flags)
+ 	if (ret != ERI_NOT_IMPLEMENTED)
+ 		return ret;
+ 
+-#if OS_ANDROID
++#if OS_ANDROID || defined(__EMSCRIPTEN__)
+ 	// Android has no easy way to get user input here,
+ 	// so continue or exit automatically
+ 	if(no_continue)
+diff --git a/source/ps/GameSetup/Paths.cpp b/source/ps/GameSetup/Paths.cpp
+index 474364e8..d91e24eb 100644
+--- a/source/ps/GameSetup/Paths.cpp
++++ b/source/ps/GameSetup/Paths.cpp
+@@ -157,6 +157,10 @@ Paths::Paths(const CmdLineArgs& args)
+ {
+ #if OS_ANDROID
+ 	return OsPath("/sdcard/0ad"); // TODO: this is kind of bogus
++#elif defined(__EMSCRIPTEN__)
++	// The browser build mounts the game files in a virtual filesystem at /0ad.
++	UNUSED2(argv0);
++	return OsPath("/0ad");
+ #else
+ 
+ 	// get full path to executable
+diff --git a/source/scriptinterface/ScriptConversions.h b/source/scriptinterface/ScriptConversions.h
+index 7f98d89b..1ae99ace 100644
+--- a/source/scriptinterface/ScriptConversions.h
++++ b/source/scriptinterface/ScriptConversions.h
+@@ -65,6 +65,12 @@ inline void ToJSVal<JS::HandleValue>(const ScriptRequest& UNUSED(rq), JS::Mutabl
+ 	handle.set(a);
+ }
+ 
++template<>
++inline void ToJSVal<JS::Value>(const ScriptRequest& UNUSED(rq), JS::MutableHandleValue handle, const JS::Value& a)
++{
++	handle.set(a);
++}
++
+ /**
+  * Convert a named property of an object to a C++ type.
+  */
+diff --git a/source/scriptinterface/ScriptInterface.cpp b/source/scriptinterface/ScriptInterface.cpp
+index de8b0de4..aa512636 100644
+--- a/source/scriptinterface/ScriptInterface.cpp
++++ b/source/scriptinterface/ScriptInterface.cpp
+@@ -298,6 +298,7 @@ ScriptInterface_impl::ScriptInterface_impl(const char* nativeScopeName, ScriptCo
+ 	ENSURE(m_cx);
+ 	JS_SetContextOpaque(m_cx, nullptr);
+ 	m_glob = JSShim_GlobalObject(m_cx);
++	JSShim_InstallPrelude(m_cx);
+ 
+ 	JS_DefineProperty(m_cx, m_glob, "global", JS::HandleObject(m_glob), JSPROP_ENUMERATE | JSPROP_READONLY | JSPROP_PERMANENT);
+ 
+-- 
+2.43.0
+

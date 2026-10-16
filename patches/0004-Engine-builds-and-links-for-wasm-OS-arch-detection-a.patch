@@ -1,7 +1,7 @@
 From c51a22abcb56d62aa1646797e9349e142d12e24d Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Fri, 16 Oct 2026 09:26:31 +0000
-Subject: [PATCH 4/4] Engine builds and links for wasm: OS/arch detection,
+Subject: [PATCH 4/5] Engine builds and links for wasm: OS/arch detection,
  aio/ldbg/GL-compute guards, root check
 
 Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>

@@ -512,3 +512,6 @@ JSFunction* JS_ValueToFunction(JSContext* cx, JS::HandleValue v);
 JSString* JS_GetFunctionId(JSFunction* fun);
 
 inline bool JS_DoubleIsInt32(double d, int32_t* out) { int32_t i = (int32_t)d; if ((double)i == d && !(i == 0 && std::signbit(d))) { *out = i; return true; } return false; }
+
+// SpiderMonkey-only globals (uneval, toSource) that the game scripts use.
+void JSShim_InstallPrelude(JSContext* cx);

@@ -47,5 +47,5 @@ B=$D/boost-inc; S=$D/boost/libs
 for f in $S/filesystem/src/*.cpp; do n=$(basename $f .cpp)
   echo "em++ -std=c++17 $FLAGS -DBOOST_FILESYSTEM_STATIC_LINK=1 -DBOOST_SYSTEM_NO_LIB -DBOOST_ALL_NO_LIB -DBOOST_FILESYSTEM_NO_CXX20_ATOMIC_REF -I$B -I$S/filesystem/src -c $f -o fs_$n.o"
 done | xargs -P4 -I{} sh -c '{}'
-emar rcs libboost_fs.a fs_*.o
+emar rcs libboost_fs.a fs_*.o && cp libboost_fs.a $P/lib/libboost_fs.a
 echo "deps done"

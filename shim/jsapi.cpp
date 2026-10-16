@@ -800,3 +800,41 @@ JSString* JS_GetFunctionId(JSFunction* fun) {
 	if (!JS_IsString(n)) { JS_FreeValue(cx, n); return nullptr; }
 	return JS::Conv<JSString*>::from(Pooled(cx, n).raw());
 }
+
+// ======== Prelude: SpiderMonkey non-standard globals ========
+void JSShim_InstallPrelude(JSContext* cx) {
+	static const char* kPrelude = R"JS(
+(function (g) {
+	function q(s) { return JSON.stringify(s); }
+	function key(k) { return /^[A-Za-z_$][\w$]*$/.test(k) ? k : q(k); }
+	function u(v, seen) {
+		switch (typeof v) {
+		case 'undefined': return 'undefined';
+		case 'boolean': return String(v);
+		case 'number': return (v === 0 && 1 / v < 0) ? '-0' : String(v);
+		case 'bigint': return String(v) + 'n';
+		case 'string': return q(v);
+		case 'symbol': return String(v);
+		case 'function': return Function.prototype.toString.call(v);
+		}
+		if (v === null) return 'null';
+		if (seen.indexOf(v) >= 0) return '({})';
+		seen.push(v);
+		let r;
+		if (Array.isArray(v)) r = '[' + Array.prototype.map.call(v, e => u(e, seen)).join(', ') + ']';
+		else if (v instanceof Date) r = '(new Date(' + v.getTime() + '))';
+		else if (v instanceof RegExp) r = String(v);
+		else if (v instanceof Map) r = '(new Map([' + Array.from(v, e => '[' + u(e[0], seen) + ', ' + u(e[1], seen) + ']').join(', ') + ']))';
+		else if (v instanceof Set) r = '(new Set([' + Array.from(v, e => u(e, seen)).join(', ') + ']))';
+		else r = '({' + Object.keys(v).map(k => key(k) + ':' + u(v[k], seen)).join(', ') + '})';
+		seen.pop();
+		return r;
+	}
+	g.uneval = function uneval(v) { return u(v, []); };
+	Object.defineProperty(Object.prototype, 'toSource', { value: function toSource() { return u(this, []); }, writable: true, configurable: true, enumerable: false });
+})(globalThis);
+)JS";
+	JSValue r = JS_Eval(cx, kPrelude, strlen(kPrelude), "<prelude>", JS_EVAL_TYPE_GLOBAL);
+	if (JS_IsException(r)) { JSValue e = JS_GetException(cx); const char* m = JS_ToCString(cx, e); fprintf(stderr, "prelude failed: %s\n", m ? m : "?"); JS_FreeValue(cx, e); }
+	JS_FreeValue(cx, r);
+}

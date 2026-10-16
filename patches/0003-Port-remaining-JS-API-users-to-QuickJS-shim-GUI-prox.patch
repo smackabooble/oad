@@ -1,7 +1,7 @@
 From f23810a0a413d6a55052ea4386b3aec4f2369481 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Fri, 16 Oct 2026 09:03:23 +0000
-Subject: [PATCH 3/4] Port remaining JS API users to QuickJS shim (GUI proxy,
+Subject: [PATCH 3/5] Port remaining JS API users to QuickJS shim (GUI proxy,
  serializers, collections)
 
 Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>

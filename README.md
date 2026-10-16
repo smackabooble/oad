@@ -13,12 +13,12 @@ Goal: build the real 0 A.D. engine for the browser with Emscripten, replacing Sp
 ## Status
 - Phase 2 (libraries) done: zlib, libpng, freetype, ogg/vorbis, SDL2, ICU, libsodium, ENet, fmt, libxml2, Boost.Filesystem.
 - Phase 3 (SpiderMonkey -> QuickJS) done: all JS-API users compile against the shim.
-- Phase 4 (whole engine): **all 445 engine sources compile and the engine LINKS** to pyrogenesis.wasm.
-  Under Node the real startup code runs (reaches `RunGameOrAtlas` / `TaskManager::Initialise`),
-  where it stops because the first build had no threads / C++ exceptions.
-  Now rebuilding everything with `-pthread -fwasm-exceptions` (`build/build_deps.sh`, `build/gen_ninja.py`).
+- Phase 4 (whole engine) done: all 445 engine sources compile with `-pthread -fwasm-exceptions` and link to pyrogenesis.wasm.
+  **Milestone:** under Node, headless (`-autostart=scenarios/arcadia -autostart-nonvisual`), the real game loads the map,
+  all entity templates and all JS simulation components on QuickJS, prints `GAME STARTED, ALL INIT COMPLETE` with no
+  errors, and runs the simulation (~240 turns/s). Threads, C++ exceptions, VFS, config, QuickJS shim all work.
 - Stubbed for the browser: lobby (gloox), Atlas editor, Vulkan, X11, curl (mod.io / user reports), dir watching, NVTT, UPnP.
-- Next: get past startup in Node, load game data (VFS), then WebGL2 rendering + browser main loop (phase 5).
+- Next (phase 5-8): WebGL2 rendering + browser main loop, game data delivery (lazy fetch), audio, packaging.
 
 ## Build
 1. `build/build_deps.sh` builds dependencies (needs emsdk, sources in deps/).
