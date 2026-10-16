@@ -24,6 +24,8 @@ struct PropertyKey {
 	JSAtom atom = 0;
 	PropertyKey() {}
 	explicit PropertyKey(JSAtom a) : atom(a) {}
+	static PropertyKey Int(int i);
+	static PropertyKey fromPinnedString(JSString* s);
 };
 template<> struct Conv<PropertyKey> {
 	static JSValue to(const PropertyKey&) { return JS_UNDEFINED; } // atoms are not refcounted JSValues
@@ -98,6 +100,7 @@ public:
 	decltype(auto) operator*() const { if constexpr (std::is_pointer_v<T>) return **p; else return (*p); }
 	auto operator->() const { if constexpr (std::is_pointer_v<T>) return *p; else return p; }
 	const T* address() const { return p; }
+	static Handle fromMarkedLocation(const T* ptr) { return Handle(*ptr); }
 };
 
 template<typename T>

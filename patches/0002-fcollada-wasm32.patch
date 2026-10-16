@@ -1,0 +1,12 @@
+--- a/src/FCollada/FUtils/FUStringBuilder.h	2020-12-06 18:43:48.000000000 +0000
++++ b/src/FCollada/FUtils/FUStringBuilder.h
+@@ -137,6 +137,9 @@
+ #endif
+ #elif defined(__APPLE__) || defined(__OpenBSD__)
+ 	inline void append(size_t i) { append((uint64)i); }
++#elif defined(__EMSCRIPTEN__)
++	// wasm32: size_t is "unsigned long", distinct from uint32 and uint64
++	inline void append(unsigned long i) { append((uint32)i); }
+ #endif // defined(WIN32)
+ 
+ 	/** Appends the floating-point value, after converting it to a string,

@@ -558,6 +558,9 @@ void JSShim_RequestLeave(JSContext* cx) { if (--t_depth == 0) JSShim_PoolRelease
 bool JS_Init() { return true; }
 void JS_ShutDown() {}
 
+JS::PropertyKey JS::PropertyKey::Int(int i) { return JS::PropertyKey(JS_NewAtomUInt32(t_globalCx, (uint32_t)i)); }
+JS::PropertyKey JS::PropertyKey::fromPinnedString(JSString* s) { return JS::PropertyKey(JS_ValueToAtom(t_globalCx, JS::Conv<JSString*>::to(s))); }
+JSString* JS_AtomizeAndPinString(JSContext* cx, const char* s) { return JS_NewStringCopyZ(cx, s); }
 JS::PropertyKey INT_TO_JSID(int i) { return JS::PropertyKey(JS_NewAtomUInt32(t_globalCx, (uint32_t)i)); }
 
 // ======== Batch implementations ========

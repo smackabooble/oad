@@ -17,6 +17,7 @@ struct curl_slist* curl_slist_append(struct curl_slist* l, const char* s) {
 }
 void curl_slist_free_all(struct curl_slist* l) { while (l) { curl_slist* n = l->next; free(l->data); free(l); l = n; } }
 const char* curl_version(void) { return "stub"; }
+const curl_version_info_data* curl_version_info(int) { static const curl_version_info_data d = { 4, "stub", 0x070000 }; return &d; }
 CURLM* curl_multi_init(void) { return (CURLM*)calloc(1, 1); }
 CURLMcode curl_multi_cleanup(CURLM* m) { free(m); return CURLM_OK; }
 CURLMcode curl_multi_add_handle(CURLM*, CURL*) { return CURLM_OK; }

@@ -14,7 +14,7 @@ Goal: build the real 0 A.D. engine for the browser with Emscripten, replacing Sp
   Values, Rooted/Handle types, natives (trampoline), properties, arrays, strings, JSON, classes.
   Rooting model: Rooted/Handle are plain storage; values created during a request live in a
   per-thread pool released by the outermost ScriptRequest. Heap/PersistentRooted hold real refs.
-- `patches/` — patches against upstream 0ad/0ad (`git am`).
+- `patches/` — the browser-port patch for the 0 A.D. Release 27.1 source (applied by `build/setup_sources.sh`).
 
 ## Status
 - Phase 2 (libraries) done: zlib, libpng, freetype, ogg/vorbis, SDL2, ICU, libsodium, ENet, fmt, libxml2, Boost.Filesystem.

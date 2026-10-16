@@ -8,9 +8,15 @@ mkdir -p "$ROOT/deps" && cd "$ROOT"
 [ -d emsdk ] || git clone --depth 1 https://github.com/emscripten-core/emsdk.git
 (cd emsdk && ./emsdk install latest && ./emsdk activate latest)
 
-if [ ! -d src ]; then
-  git clone https://github.com/0ad/0ad.git src
-  (cd src && git checkout -b wasm-quickjs-port && git am "$REPO"/patches/*.patch)
+# Engine source: the 0 A.D. Release 27.1 tarball (the game data must be the same release), plus our port patch.
+if [ ! -d src27 ]; then
+  curl -sSLO http://archive.ubuntu.com/ubuntu/pool/universe/0/0ad/0ad_0.27.1.orig.tar.xz
+  mkdir src27 && tar xf 0ad_0.27.1.orig.tar.xz -C src27 --strip-components=1
+  (cd src27 && patch -p1 < "$REPO"/patches/0001-0ad-0.27.1-browser-port.patch)
+  # FCollada: extract the bundled sources and apply the wasm32 size_t fix
+  (cd src27/libraries/source/fcollada && tar xf fcollada-28209.tar.xz && cp -r fcollada-28209/src fcollada-28209/include . && \
+   patch -p1 < "$REPO"/patches/0002-fcollada-wasm32.patch)
+  (cd src27/libraries/source/cxxtest-4.4 && tar xf cxxtest-4.4.tar.gz --strip-components=1)
 fi
 
 cd deps

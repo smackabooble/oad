@@ -1,51 +1,1598 @@
-From 66734f1829086ef1da246b0a93dd02a57c4b9bef Mon Sep 17 00:00:00 2001
-From: Claude <noreply@anthropic.com>
-Date: Fri, 16 Oct 2026 11:18:08 +0000
-Subject: [PATCH 7/8] In-game rendering in the browser: WebGL2
- loader/formats/blit, static COLLADA, lobby stubs, shader loop fix
 
-Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01V1KTZf1EfjbXMf1biK2Kv5
----
- .../src/FCollada/FUtils/FUStringBuilder.h     |   3 +
- libraries/source/glad/include/glad/gles2.h    | 655 +++++++++++++++++-
- libraries/source/glad/src/gles2.cpp           | 323 +++++++--
- source/graphics/ColladaManager.cpp            |  18 +
- .../external_libraries/opengles2_wrapper.h    |  20 +
- source/lib/tex/tex.cpp                        |   7 +-
- source/renderer/backend/gl/Device.cpp         |   4 +-
- .../backend/gl/DeviceCommandContext.cpp       |   7 +-
- source/renderer/backend/gl/Framebuffer.cpp    |   8 +-
- source/renderer/backend/gl/ShaderProgram.cpp  |   3 +
- source/renderer/backend/gl/Texture.cpp        |  30 +-
- 11 files changed, 1000 insertions(+), 78 deletions(-)
-
-diff --git a/libraries/source/fcollada/src/FCollada/FUtils/FUStringBuilder.h b/libraries/source/fcollada/src/FCollada/FUtils/FUStringBuilder.h
-index 21e07c49..1c63b52b 100644
---- a/libraries/source/fcollada/src/FCollada/FUtils/FUStringBuilder.h
-+++ b/libraries/source/fcollada/src/FCollada/FUtils/FUStringBuilder.h
-@@ -137,6 +137,9 @@ public:
- #endif
- #elif defined(__APPLE__) || defined(__OpenBSD__)
- 	inline void append(size_t i) { append((uint64)i); }
-+#elif defined(__EMSCRIPTEN__)
-+	// wasm32: size_t is "unsigned long", distinct from uint32 and uint64
-+	inline void append(unsigned long i) { append((uint32)i); }
- #endif // defined(WIN32)
+--- a/source/graphics/ColladaManager.cpp	2025-04-28 20:20:23.000000000 +0000
++++ b/source/graphics/ColladaManager.cpp	2026-10-16 13:45:26.427352109 +0000
+@@ -55,6 +55,17 @@
+ 	}
+ }
  
- 	/** Appends the floating-point value, after converting it to a string,
-diff --git a/libraries/source/glad/include/glad/gles2.h b/libraries/source/glad/include/glad/gles2.h
-index 536ab7f2..34708aa5 100644
---- a/libraries/source/glad/include/glad/gles2.h
-+++ b/libraries/source/glad/include/glad/gles2.h
++#if defined(__EMSCRIPTEN__)
++// The browser build links the converter statically instead of dlopen()ing it.
++extern "C"
++{
++void set_logger(Collada::LogFn logger, void* cb_data);
++int set_skeleton_definitions(const char* xml, int length);
++int convert_dae_to_pmd(const char* dae, Collada::OutputFn pmd_writer, void* cb_data);
++int convert_dae_to_psa(const char* dae, Collada::OutputFn psa_writer, void* cb_data);
++}
++#endif
++
+ class CColladaManagerImpl
+ {
+ 	DllLoader dll;
+@@ -186,6 +197,13 @@
+ 
+ 	bool TryLoadDLL()
+ 	{
++#if defined(__EMSCRIPTEN__)
++		this->set_logger = &::set_logger;
++		this->set_skeleton_definitions = &::set_skeleton_definitions;
++		this->convert_dae_to_pmd = &::convert_dae_to_pmd;
++		this->convert_dae_to_psa = &::convert_dae_to_psa;
++		return true;
++#endif
+ 		if (!dll.LoadDLL())
+ 		{
+ 			LOGERROR("Failed to load COLLADA conversion DLL");
+
+--- a/source/graphics/TextureConverter.cpp	2025-04-28 20:20:23.000000000 +0000
++++ b/source/graphics/TextureConverter.cpp	2026-10-16 13:56:02.593105187 +0000
+@@ -105,6 +105,98 @@
+ 	bool ret; // true if the conversion succeeded
+ };
+ 
++#else // CONFIG2_NVTT
++
++namespace
++{
++
++constexpr size_t MAX_QUEUE_SIZE_FOR_OPTIMAL_UTILIZATION{12};
++
++struct BufferOutputHandler
++{
++	std::vector<u8> buffer;
++};
++
++/**
++ * Fallback for builds without NVTT (e.g. the browser build): writes an uncompressed DDS with a
++ * box-filtered mipmap chain. @p level holds BGRA (32 bit) or greyscale (8 bit) pixels.
++ */
++std::vector<u8> BuildUncompressedDDS(std::vector<u8> level, size_t w, size_t h, size_t bpp, bool mipmaps)
++{
++	const size_t bytes = bpp / 8;
++	size_t levels = 1;
++	if (mipmaps)
++		for (size_t m = std::max(w, h); m > 1; m >>= 1)
++			++levels;
++
++	std::vector<u8> out(128, 0);
++	const auto put32 = [&out](size_t offset, u32 value) { memcpy(&out[offset], &value, 4); };
++	memcpy(&out[0], "DDS ", 4);
++	put32(4, 124);
++	put32(8, 0x1 | 0x2 | 0x4 | 0x1000 | (mipmaps ? 0x20000 : 0)); // caps, height, width, pixel format, mip count
++	put32(12, static_cast<u32>(h));
++	put32(16, static_cast<u32>(w));
++	put32(28, mipmaps ? static_cast<u32>(levels) : 0);
++	put32(76, 32); // pixel format size
++	if (bytes == 4)
++	{
++		// The decoder requires R,G,B,A byte order, but the converted source is BGRA.
++		for (size_t i = 0; i + 3 < level.size(); i += 4)
++			std::swap(level[i], level[i + 2]);
++		put32(80, 0x40 | 0x1);
++		put32(88, 32);
++		put32(92, 0xFF);
++		put32(96, 0xFF00);
++		put32(100, 0xFF0000);
++		put32(104, 0xFF000000u);
++	}
++	else
++	{
++		put32(80, 0x2);
++		put32(88, 8);
++		put32(104, 0xFF);
++	}
++	put32(108, 0x1000 | (mipmaps ? (0x400000 | 0x8) : 0));
++
++	for (size_t i = 0;; ++i)
++	{
++		out.insert(out.end(), level.begin(), level.end());
++		if (i + 1 >= levels)
++			break;
++		const size_t nw = std::max<size_t>(1, w / 2);
++		const size_t nh = std::max<size_t>(1, h / 2);
++		std::vector<u8> next(nw * nh * bytes);
++		for (size_t y = 0; y < nh; ++y)
++			for (size_t x = 0; x < nw; ++x)
++				for (size_t c = 0; c < bytes; ++c)
++				{
++					unsigned sum = 0, count = 0;
++					for (size_t dy = 0; dy < 2; ++dy)
++						for (size_t dx = 0; dx < 2; ++dx)
++						{
++							const size_t sx = std::min(w - 1, x * 2 + dx), sy = std::min(h - 1, y * 2 + dy);
++							sum += level[(sy * w + sx) * bytes + c];
++							++count;
++						}
++					next[(y * nw + x) * bytes + c] = static_cast<u8>((sum + count / 2) / count);
++				}
++		level = std::move(next);
++		w = nw;
++		h = nh;
++	}
++	return out;
++}
++
++} // anonymous namespace
++
++struct CTextureConverter::ConversionResult
++{
++	VfsPath dest;
++	CTexturePtr texture;
++	BufferOutputHandler output;
++	bool ret;
++};
++
+ #endif // CONFIG2_NVTT
+ 
+ void CTextureConverter::Settings::Hash(MD5& hash)
+@@ -480,14 +572,28 @@
+ 	return true;
+ 
+ #else // CONFIG2_NVTT
+-	LOGERROR("Failed to convert texture \"%s\" (NVTT not available)", src.string8());
+-	return false;
++	// No NVTT available: fall back to uncompressed output.
++	{
++		const size_t width = tex.m_Width, height = tex.m_Height, bpp = tex.m_Bpp;
++		const bool mipmaps = settings.mipmap == MIP_TRUE;
++		std::vector<u8> base(tex.get_data(), tex.get_data() + width * height * (bpp / 8));
++		m_ResultQueue.push(g_TaskManager.PushTask(
++			[dest, texture, base = std::move(base), width, height, bpp, mipmaps]() mutable
++			{
++				std::unique_ptr<ConversionResult> result = std::make_unique<ConversionResult>();
++				result->dest = dest;
++				result->texture = texture;
++				result->ret = true;
++				result->output.buffer = BuildUncompressedDDS(std::move(base), width, height, bpp, mipmaps);
++				return result;
++			}, Threading::TaskPriority::LOW));
++	}
++	return true;
+ #endif // !CONFIG2_NVTT
+ }
+ 
+ bool CTextureConverter::Poll(CTexturePtr& texture, VfsPath& dest, bool& ok)
+ {
+-#if CONFIG2_NVTT
+ 	if (m_ResultQueue.empty() || !m_ResultQueue.front().IsDone())
+ 	{
+ 		// no work to do
+@@ -521,17 +627,9 @@
+ 	dest = result->dest;
+ 	ok = true;
+ 	return true;
+-
+-#else // CONFIG2_NVTT
+-	return false;
+-#endif // !CONFIG2_NVTT
+ }
+ 
+ bool CTextureConverter::IsBusy() const
+ {
+-#if CONFIG2_NVTT
+ 	return m_ResultQueue.size() >= MAX_QUEUE_SIZE_FOR_OPTIMAL_UTILIZATION;
+-#else // CONFIG2_NVTT
+-	return false;
+-#endif // !CONFIG2_NVTT
+ }
+
+--- a/source/graphics/TextureConverter.h	2025-04-28 20:20:23.000000000 +0000
++++ b/source/graphics/TextureConverter.h	2026-10-16 13:45:26.428608090 +0000
+@@ -23,12 +23,10 @@
+ 
+ #include "TextureManager.h"
+ 
+-#if CONFIG2_NVTT
+ #include "ps/Future.h"
+ 
+ #include <memory>
+ #include <queue>
+-#endif
+ 
+ class MD5;
+ 
+@@ -207,11 +205,9 @@
+ 	PIVFS m_VFS;
+ 	bool m_HighQuality;
+ 
+-#if CONFIG2_NVTT
+ 	struct ConversionResult;
+ 
+ 	std::queue<Future<std::unique_ptr<ConversionResult>>> m_ResultQueue;
+-#endif
+ };
+ 
+ #endif // INCLUDED_TEXTURECONVERTER
+
+--- a/source/lib/debug.cpp	2025-04-28 20:20:23.000000000 +0000
++++ b/source/lib/debug.cpp	2026-10-16 13:45:26.428608090 +0000
+@@ -281,7 +281,8 @@
+ 	))
+ 	{
+ fail:
+-		return L"(error while formatting error message)";
++		// Formatting failed; the description alone is still far more useful than nothing.
++		return description;
+ 	}
+ 
+ 	// append stack trace
+
+--- a/source/lib/external_libraries/opengles2_wrapper.h	2025-04-28 20:20:23.000000000 +0000
++++ b/source/lib/external_libraries/opengles2_wrapper.h	2026-10-16 13:45:26.428608090 +0000
+@@ -81,9 +81,29 @@
+ // GL_OES_rgb8_rgba8
+ #define GL_RGBA8 GL_RGBA8_OES
+ 
++#if defined(__EMSCRIPTEN__)
++// WebGL2 (OpenGL ES 3.0) core equivalents of desktop EXT functionality.
++#define glBlitFramebufferEXT glBlitFramebuffer
++#define GL_READ_FRAMEBUFFER_EXT GL_READ_FRAMEBUFFER
++#define GL_DRAW_FRAMEBUFFER_EXT GL_DRAW_FRAMEBUFFER
++#endif
++
++#if defined(__EMSCRIPTEN__)
++// WebGL has neither GL_OES_mapbuffer nor glMapBuffer; Emscripten emulates glMapBufferRange
++// (with -sFULL_ES3), writing the data back with glBufferSubData on unmap.
++inline void* oad_MapBufferWrite(GLenum target, GLenum /*access*/)
++{
++	GLint size = 0;
++	glGetBufferParameteriv(target, GL_BUFFER_SIZE, &size);
++	return glMapBufferRange(target, 0, size, GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
++}
++#define glMapBufferARB oad_MapBufferWrite
++#define glUnmapBufferARB glUnmapBuffer
++#else
+ // GL_OES_mapbuffer
+ #define glMapBufferARB glMapBufferOES
+ #define glUnmapBufferARB glUnmapBufferOES
++#endif
+ 
+ // GL_OES_depth32
+ #define GL_DEPTH_COMPONENT32 GL_DEPTH_COMPONENT32_OES
+
+--- a/source/lib/posix/posix_aio.h	2025-04-28 20:20:24.000000000 +0000
++++ b/source/lib/posix/posix_aio.h	2026-10-16 13:45:26.428608090 +0000
+@@ -30,7 +30,7 @@
+ 
+ #if OS_WIN
+ # include "lib/sysdep/os/win/wposix/waio.h"
+-#elif OS_ANDROID || OS_OPENBSD
++#elif OS_ANDROID || OS_OPENBSD || defined(__EMSCRIPTEN__)
+ // Android doesn't provide aio.h. We don't actually use aio on Linuxes (see
+ // CONFIG2_FILE_ENABLE_AIO) but we use its symbols and structs, so define
+ // them here
+
+--- a/source/lib/sysdep/arch.h	2025-04-28 20:20:24.000000000 +0000
++++ b/source/lib/sysdep/arch.h	2026-10-16 13:45:26.428608090 +0000
+@@ -83,8 +83,15 @@
+ # define ARCH_E2K 0
+ #endif
+ 
++// .. WebAssembly (Emscripten port)
++#if defined(__wasm__) || defined(__EMSCRIPTEN__)
++# define ARCH_WASM 1
++#else
++# define ARCH_WASM 0
++#endif
++
+ // ensure exactly one architecture has been detected
+-#if (ARCH_IA32+ARCH_IA64+ARCH_AMD64+ARCH_ALPHA+ARCH_ARM+ARCH_AARCH64+ARCH_MIPS+ARCH_E2K+ARCH_PPC64) != 1
++#if (ARCH_IA32+ARCH_IA64+ARCH_AMD64+ARCH_ALPHA+ARCH_ARM+ARCH_AARCH64+ARCH_MIPS+ARCH_E2K+ARCH_PPC64+ARCH_WASM) != 1
+ # error "architecture not correctly detected (either none or multiple ARCH_* defined)"
+ #endif
+ 
+
+--- a/source/lib/sysdep/os/linux/ldbg.cpp	2025-04-28 20:20:24.000000000 +0000
++++ b/source/lib/sysdep/os/linux/ldbg.cpp	2026-10-16 13:45:26.428857347 +0000
+@@ -37,7 +37,7 @@
+ #include <cstring>
+ #include <sys/syscall.h>
+ 
+-#if OS_ANDROID
++#if OS_ANDROID || defined(__EMSCRIPTEN__)
+ 
+ // Android NDK doesn't support backtrace()
+ // TODO: use unwind.h or similar?
+@@ -166,6 +166,10 @@
+ 	constexpr size_t MAX_THREAD_NAME_LEN = 15;
+ 	constexpr size_t MAX_FILE_PATH_LEN = 32;
+ 
++#if defined(__EMSCRIPTEN__)
++	(void)name; (void)MAX_THREAD_NAME_LEN; (void)MAX_FILE_PATH_LEN;
++	return;
++#else
+ 	char pathname[MAX_FILE_PATH_LEN];
+ 	pid_t tid = syscall(SYS_gettid);
+ 	snprintf(pathname, MAX_FILE_PATH_LEN, "/proc/self/task/%d/comm", tid);
+@@ -177,4 +181,5 @@
+ 	std::string limited_name(name, std::min(strlen(name), MAX_THREAD_NAME_LEN));
+ 	fputs(limited_name.c_str(), comm);
+ 	fclose(comm);
++#endif
+ }
+
+--- a/source/lib/sysdep/os/unix/unix.cpp	2025-04-28 20:20:24.000000000 +0000
++++ b/source/lib/sysdep/os/unix/unix.cpp	2026-10-16 13:45:26.428857347 +0000
+@@ -217,7 +217,7 @@
+ 	if (ret != ERI_NOT_IMPLEMENTED)
+ 		return ret;
+ 
+-#if OS_ANDROID
++#if OS_ANDROID || defined(__EMSCRIPTEN__)
+ 	// Android has no easy way to get user input here,
+ 	// so continue or exit automatically
+ 	if(no_continue)
+
+--- a/source/lib/sysdep/os.h	2025-04-28 20:20:24.000000000 +0000
++++ b/source/lib/sysdep/os.h	2026-10-16 13:45:26.428857347 +0000
+@@ -48,7 +48,7 @@
+ # define OS_WIN 0
+ #endif
+ // Linux
+-#if defined(linux) || defined(__linux) || defined(__linux__)
++#if defined(linux) || defined(__linux) || defined(__linux__) || defined(__EMSCRIPTEN__)
+ # define OS_LINUX 1
+ #else
+ # define OS_LINUX 0
+
+--- a/source/lib/tex/tex.cpp	2025-04-28 20:20:24.000000000 +0000
++++ b/source/lib/tex/tex.cpp	2026-10-16 13:45:26.428857347 +0000
+@@ -660,7 +660,12 @@
+ 	WARN_IF_ERR(basetex.transform_to(TEX_BGR | TEX_ALPHA));
+ 
+ 	// extract components into u32
+-	ENSURE(basetex.m_DataSize >= basetex.m_Ofs+4);
++	if(basetex.m_DataSize < basetex.m_Ofs+4)
++	{
++		// e.g. 8-bit greyscale textures that cannot be expanded to BGRA: no meaningful average colour
++		debug_printf("Tex::get_average_color: unsupported layout (bpp=%zu flags=0x%zx dataSize=%zu)\n", m_Bpp, m_Flags, basetex.m_DataSize);
++		return 0;
++	}
+ 	u8 b = basetex.m_Data.get()[basetex.m_Ofs];
+ 	u8 g = basetex.m_Data.get()[basetex.m_Ofs+1];
+ 	u8 r = basetex.m_Data.get()[basetex.m_Ofs+2];
+
+--- a/source/main.cpp	2025-04-28 20:20:24.000000000 +0000
++++ b/source/main.cpp	2026-10-16 13:46:17.713679105 +0000
+@@ -31,6 +31,21 @@
+ #define MINIMAL_PCH 2
+ #include "lib/precompiled.h"
+ 
++#if defined(__EMSCRIPTEN__)
++#include <emscripten.h>
++
++// Resolves on the next display refresh (falls back to a 16 ms timer where rAF is unavailable in workers).
++// Returning to the event loop here is also what makes the browser present the finished frame.
++EM_ASYNC_JS(void, oad_wait_for_next_frame, (), {
++	await new Promise(resolve => {
++		if (typeof requestAnimationFrame === 'function')
++			requestAnimationFrame(() => resolve());
++		else
++			setTimeout(resolve, 16);
++	});
++});
++#endif
++
+ #include "lib/debug.h"
+ #include "lib/status.h"
+ #include "lib/secure_crt.h"
+@@ -700,6 +715,11 @@
+ 				rlInterface->TryApplyMessage();
+ 			else
+ 				NonVisualFrame();
++#if defined(__EMSCRIPTEN__)
++			// Return to the browser's event loop so the finished frame is presented
++			// (an OffscreenCanvas in a worker only shows its content once the task ends).
++			oad_wait_for_next_frame();
++#endif
+ 		}
+ 
+ 		ShutdownNetworkAndUI();
+@@ -726,9 +746,16 @@
+ extern "C" __attribute__((visibility ("default"))) int main(int argc, char* argv[]);
+ #endif
+ 
++#if defined(__EMSCRIPTEN__)
++void WasmMountGameData();
++#endif
++
+ extern "C" int main(int argc, char* argv[])
+ {
+-#if OS_UNIX
++#if defined(__EMSCRIPTEN__)
++	WasmMountGameData();
++#endif
++#if OS_UNIX && !defined(__EMSCRIPTEN__)
+ 	// Don't allow people to run the game with root permissions,
+ 	//	because bad things can happen, check before we do anything
+ 	if (geteuid() == 0)
+
+--- a/source/network/NetMessageSim.cpp	2025-04-28 20:20:24.000000000 +0000
++++ b/source/network/NetMessageSim.cpp	2026-10-16 13:45:26.428990274 +0000
+@@ -146,7 +146,7 @@
+ 	serializer.NumberI32_Unbounded("player", m_Player);
+ 	serializer.NumberU32_Unbounded("turn", m_Turn);
+ 
+-	serializer.ScriptVal("command", const_cast<JS::PersistentRootedValue*>(&m_Data));
++	serializer.ScriptVal("command", &const_cast<JS::PersistentRootedValue&>(m_Data));
+ 	return serializer.GetBuffer();
+ }
+ 
+@@ -175,13 +175,13 @@
+ 
+ 	// TODO: The cast can probably be removed if and when ScriptVal can take a JS::HandleValue instead of
+ 	// a JS::MutableHandleValue (relies on JSAPI change). Also search for other casts like this one in that case.
+-	serializer.ScriptVal("command", const_cast<JS::PersistentRootedValue*>(&m_Data));
++	serializer.ScriptVal("command", &const_cast<JS::PersistentRootedValue&>(m_Data));
+ 	return CNetMessage::GetSerializedLength() + serializer.GetLength();
+ }
+ 
+ CStr CSimulationMessage::ToString() const
+ {
+-	std::string source = Script::ToString(ScriptRequest(m_ScriptInterface), const_cast<JS::PersistentRootedValue*>(&m_Data));
++	std::string source = Script::ToString(ScriptRequest(m_ScriptInterface), &const_cast<JS::PersistentRootedValue&>(m_Data));
+ 
+ 	std::stringstream stream;
+ 	stream << "CSimulationMessage { m_Client: " << m_Client << ", m_Player: " << m_Player << ", m_Turn: " << m_Turn << ", m_Data: " << source << " }";
+@@ -208,7 +208,7 @@
+ 	// TODO: ought to handle serialization exceptions
+ 	u8* pos = CNetMessage::Serialize(pBuffer);
+ 	CBufferBinarySerializer serializer(m_ScriptInterface, pos);
+-	serializer.ScriptVal("command", const_cast<JS::PersistentRootedValue*>(&m_Data));
++	serializer.ScriptVal("command", &const_cast<JS::PersistentRootedValue&>(m_Data));
+ 	return serializer.GetBuffer();
+ }
+ 
+@@ -218,20 +218,20 @@
+ 	const u8* pos = CNetMessage::Deserialize(pStart, pEnd);
+ 	std::istringstream stream(std::string(pos, pEnd));
+ 	CStdDeserializer deserializer(m_ScriptInterface, stream);
+-	deserializer.ScriptVal("command", const_cast<JS::PersistentRootedValue*>(&m_Data));
++	deserializer.ScriptVal("command", &const_cast<JS::PersistentRootedValue&>(m_Data));
+ 	return pEnd;
+ }
+ 
+ size_t CGameSetupMessage::GetSerializedLength() const
+ {
+ 	CLengthBinarySerializer serializer(m_ScriptInterface);
+-	serializer.ScriptVal("command", const_cast<JS::PersistentRootedValue*>(&m_Data));
++	serializer.ScriptVal("command", &const_cast<JS::PersistentRootedValue&>(m_Data));
+ 	return CNetMessage::GetSerializedLength() + serializer.GetLength();
+ }
+ 
+ CStr CGameSetupMessage::ToString() const
+ {
+-	std::string source = Script::ToString(ScriptRequest(m_ScriptInterface), const_cast<JS::PersistentRootedValue*>(&m_Data));
++	std::string source = Script::ToString(ScriptRequest(m_ScriptInterface), &const_cast<JS::PersistentRootedValue&>(m_Data));
+ 
+ 	std::stringstream stream;
+ 	stream << "CGameSetupMessage { m_Data: " << source << " }";
+
+--- a/source/ps/GameSetup/GameSetup.cpp	2025-07-14 14:31:47.000000000 +0000
++++ b/source/ps/GameSetup/GameSetup.cpp	2026-10-16 14:13:06.354590057 +0000
+@@ -116,6 +116,7 @@
+ 	// displaying the error dialog hangs the desktop since the dialog box is behind the
+ 	// fullscreen window. So we just force the game to windowed mode before displaying the dialog.
+ 	// (But only if we're in the main thread, and not if we're being reentrant.)
++#if !defined(__EMSCRIPTEN__)	// the browser has no fullscreen dialog problem; Resize() on a half-initialised renderer crashes
+ 	if (Threading::IsMainThread())
+ 	{
+ 		static bool reentering = false;
+@@ -126,6 +127,7 @@
+ 			reentering = false;
+ 		}
+ 	}
++#endif
+ 
+ 	// We don't actually implement the error display here, so return appropriately
+ 	return ERI_NOT_IMPLEMENTED;
+@@ -418,8 +420,13 @@
+ 	// wide characters. Peculiarly the string "UTF-8" seems to be acceptable
+ 	// despite not being a real locale, and it's conveniently language-agnostic,
+ 	// so use that.
++#if defined(__EMSCRIPTEN__)
++	// musl only knows "C.UTF-8"; "UTF-8" would silently leave the ASCII-only C locale active.
++	setlocale(LC_ALL, "C.UTF-8");
++#else
+ 	setlocale(LC_CTYPE, "UTF-8");
+ #endif
++#endif
+ 
+ 
+ 	// On misconfigured systems with incorrect locale settings, we'll die
+
+--- a/source/ps/GameSetup/Paths.cpp	2025-04-28 20:20:24.000000000 +0000
++++ b/source/ps/GameSetup/Paths.cpp	2026-10-16 13:45:26.429049096 +0000
+@@ -157,6 +157,10 @@
+ {
+ #if OS_ANDROID
+ 	return OsPath("/sdcard/0ad"); // TODO: this is kind of bogus
++#elif defined(__EMSCRIPTEN__)
++	// The browser build mounts the game files in a virtual filesystem at /0ad.
++	UNUSED2(argv0);
++	return OsPath("/0ad");
+ #else
+ 
+ 	// get full path to executable
+
+--- a/source/ps/VideoMode.cpp	2025-04-28 20:20:24.000000000 +0000
++++ b/source/ps/VideoMode.cpp	2026-10-16 13:45:26.429049096 +0000
+@@ -372,10 +372,17 @@
+ 			else
+ 			{
+ #if CONFIG2_GLES
++#if defined(__EMSCRIPTEN__)
++				// Browser build: WebGL 2 (OpenGL ES 3.0).
++				SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
++				SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
++				SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
++#else
+ 				// Require GLES 2.0
+ 				SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+ 				SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
+ 				SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
++#endif
+ #else
+ 				// Some macOS and MESA drivers might not create a context even if they can
+ 				// with the core profile. So disable it for a while until we can guarantee
+
+--- a/source/renderer/backend/gl/Buffer.cpp	2025-04-28 20:20:25.000000000 +0000
++++ b/source/renderer/backend/gl/Buffer.cpp	2026-10-16 14:15:28.573471883 +0000
+@@ -46,11 +46,9 @@
+ 	case IBuffer::Type::INDEX:
+ 		target = GL_ELEMENT_ARRAY_BUFFER;
+ 		break;
+-#if !CONFIG2_GLES
+ 	case IBuffer::Type::UNIFORM:
+ 		target = GL_UNIFORM_BUFFER;
+ 		break;
+-#endif
+ 	default:
+ 		target = GL_ARRAY_BUFFER;
+ 		break;
+
+--- a/source/renderer/backend/gl/Device.cpp	2025-07-14 14:31:47.000000000 +0000
++++ b/source/renderer/backend/gl/Device.cpp	2026-10-16 13:45:26.429049096 +0000
+@@ -302,6 +302,14 @@
+ #endif
+ 	}
+ 
++#if CONFIG2_GLES
++	// Browser build: WebGL 2 (OpenGL ES 3.0). The desktop extension checks below do not apply.
++	if (!ogl_HaveVersion(3, 0))
++	{
++		DEBUG_DISPLAY_FATAL_ERROR(
++			L"This browser does not provide WebGL 2, which the game requires.");
++	}
++#else
+ 	// If we don't have GL2.0 then we don't have GLSL in core.
+ 	if (!arb && !ogl_HaveVersion(2, 0))
+ 		return nullptr;
+@@ -321,6 +329,7 @@
+ 			L" For more information, please see http://www.wildfiregames.com/forum/index.php?showtopic=16734"
+ 		);
+ 	}
++#endif // CONFIG2_GLES
+ 
+ 	device->m_ARB = arb;
+ 
+@@ -1062,7 +1071,7 @@
+ 	{
+ 	case Format::UNDEFINED:
+ 		break;
+-#if !CONFIG2_GLES
++#if !CONFIG2_GLES || defined(__EMSCRIPTEN__)
+ 	case Format::R8_UNORM:
+ 		supported = ogl_HaveVersion(3, 0);
+ 		break;
+@@ -1081,7 +1090,7 @@
+ {
+ 	ENSURE(depth || stencil);
+ 	if (stencil)
+-#if CONFIG2_GLES
++#if CONFIG2_GLES && !defined(__EMSCRIPTEN__)
+ 		return Format::UNDEFINED;
+ #else
+ 		return Format::D24_UNORM_S8_UINT;
+
+--- a/source/renderer/backend/gl/DeviceCommandContext.cpp	2025-07-14 14:31:47.000000000 +0000
++++ b/source/renderer/backend/gl/DeviceCommandContext.cpp	2026-10-16 14:14:12.470422498 +0000
+@@ -104,11 +104,7 @@
+ 		target = GL_ELEMENT_ARRAY_BUFFER;
+ 		break;
+ 	case CBuffer::Type::UNIFORM:
+-#if !CONFIG2_GLES
+-		target = GL_UNIFORM_BUFFER;
+-#else
+-		debug_warn("Unsupported buffer type.");
+-#endif
++		target = GL_UNIFORM_BUFFER;	// available in GLES 3.0 / WebGL2
+ 		break;
+ 	case CBuffer::Type::UPLOAD:
+ 		debug_warn("Unsupported buffer type.");
+@@ -331,9 +327,10 @@
+ 		ENSURE(layer == 0);
+ 		if (texture->GetFormat() == Format::R8G8B8A8_UNORM ||
+ 			texture->GetFormat() == Format::R8G8B8_UNORM ||
+-#if !CONFIG2_GLES
++#if !CONFIG2_GLES || defined(__EMSCRIPTEN__)
+ 			texture->GetFormat() == Format::R8_UNORM ||
+ #endif
++			texture->GetFormat() == Format::L8_UNORM ||
+ 			texture->GetFormat() == Format::A8_UNORM)
+ 		{
+ 			ENSURE(texture->GetFormat() == dataFormat);
+@@ -347,7 +344,7 @@
+ 				pixelFormat = GL_RGB;
+ 				bytesPerPixel = 3;
+ 				break;
+-#if !CONFIG2_GLES
++#if !CONFIG2_GLES || defined(__EMSCRIPTEN__)
+ 			case Format::R8_UNORM:
+ 				pixelFormat = GL_RED;
+ 				bytesPerPixel = 1;
+@@ -852,7 +849,7 @@
+ 	ENSURE(!m_InsideFramebufferPass);
+ 	CFramebuffer* destinationFramebuffer = dstFramebuffer->As<CFramebuffer>();
+ 	CFramebuffer* sourceFramebuffer = srcFramebuffer->As<CFramebuffer>();
+-#if CONFIG2_GLES
++#if CONFIG2_GLES && !defined(__EMSCRIPTEN__)
+ 	UNUSED2(destinationFramebuffer);
+ 	UNUSED2(sourceFramebuffer);
+ 	UNUSED2(destinationRegion);
+
+--- a/source/renderer/backend/gl/Framebuffer.cpp	2025-04-28 20:20:25.000000000 +0000
++++ b/source/renderer/backend/gl/Framebuffer.cpp	2026-10-16 13:45:26.429251324 +0000
+@@ -102,7 +102,13 @@
+ 			ENSURE(colorAttachment->texture->GetType() == depthStencilAttachmentTexture->GetType());
+ 		}
+ 		ENSURE(IsDepthFormat(depthStencilAttachmentTexture->GetFormat()));
+-#if CONFIG2_GLES
++#if CONFIG2_GLES && defined(__EMSCRIPTEN__)
++		// WebGL2 supports combined depth-stencil attachments.
++		const GLenum attachment = hasStencil ?
++			GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT;
++		ENSURE(depthStencilAttachmentTexture->GetType() == CTexture::Type::TEXTURE_2D);
++		const GLenum textureTarget = GL_TEXTURE_2D;
++#elif CONFIG2_GLES
+ 		ENSURE(depthStencilAttachmentTexture->GetFormat() == Format::D24_UNORM);
+ 		const GLenum attachment = GL_DEPTH_ATTACHMENT;
+ 		ENSURE(depthStencilAttachmentTexture->GetType() == CTexture::Type::TEXTURE_2D);
+
+--- a/source/renderer/backend/gl/ShaderProgram.cpp	2025-04-28 20:20:25.000000000 +0000
++++ b/source/renderer/backend/gl/ShaderProgram.cpp	2026-10-16 13:45:57.493168923 +0000
+@@ -17,6 +17,11 @@
+ 
+ #include "precompiled.h"
+ 
++#if CONFIG2_GLES && !defined(GL_COMPUTE_SHADER)
++// Compute shaders do not exist in GLES3.0/WebGL2; keep the symbol so shader tables still compile.
++# define GL_COMPUTE_SHADER 0x91B9
++#endif
++
+ #include "ShaderProgram.h"
+ 
+ #include "graphics/Color.h"
+@@ -695,10 +700,12 @@
+ 				stageDefine = "STAGE_FRAGMENT";
+ 				break;
+ #if !CONFIG2_GLES
++#if !CONFIG2_GLES
+ 			case GL_COMPUTE_SHADER:
+ 				stageDefine = "STAGE_COMPUTE";
+ 				break;
+ #endif
++#endif
+ 			default:
+ 				break;
+ 			}
+@@ -717,6 +724,9 @@
+ 			source.Replace("#version 110\r\n", "#version 100\nprecision highp float;\n");
+ 			source.Replace("#version 120\n", "#version 100\nprecision highp float;\n");
+ 			source.Replace("#version 120\r\n", "#version 100\nprecision highp float;\n");
++			// GLSL ES 1.00 requires constant loop bounds. The parallax loop is capped at 20 by the
++			// shader itself (iter = min(20, ...)), so give it a constant bound plus an early exit.
++			source.Replace("for (int i = 0; i < iter; ++i) {", "for (int i = 0; i < 20; ++i) { if (i >= iter) break;");
+ #endif
+ 			if (!CompileGLSL(shader, path, source))
+ 				return;
+
+--- a/source/renderer/backend/gl/Texture.cpp	2025-04-28 20:20:25.000000000 +0000
++++ b/source/renderer/backend/gl/Texture.cpp	2026-10-16 13:45:26.429325438 +0000
+@@ -192,9 +192,13 @@
+ 			pixelFormat = GL_RGB;
+ 			pixelType = GL_UNSIGNED_BYTE;
+ 			break;
+-#if !CONFIG2_GLES
++#if !CONFIG2_GLES || defined(__EMSCRIPTEN__)
+ 		case Format::R8_UNORM:
++#if defined(__EMSCRIPTEN__)
++			internalFormat = GL_R8; // WebGL2 needs a sized internal format
++#else
+ 			internalFormat = GL_RED;
++#endif
+ 			pixelFormat = GL_RED;
+ 			pixelType = GL_UNSIGNED_BYTE;
+ 			break;
+@@ -209,7 +213,29 @@
+ 			pixelFormat = GL_LUMINANCE;
+ 			pixelType = GL_UNSIGNED_BYTE;
+ 			break;
+-#if CONFIG2_GLES
++#if CONFIG2_GLES && defined(__EMSCRIPTEN__)
++		// WebGL2 (OpenGL ES 3.0) requires sized depth formats with a matching pixel type.
++		case Format::D16_UNORM:
++			internalFormat = GL_DEPTH_COMPONENT16;
++			pixelFormat = GL_DEPTH_COMPONENT;
++			pixelType = GL_UNSIGNED_SHORT;
++			break;
++		case Format::D24_UNORM:
++			internalFormat = GL_DEPTH_COMPONENT24;
++			pixelFormat = GL_DEPTH_COMPONENT;
++			pixelType = GL_UNSIGNED_INT;
++			break;
++		case Format::D32_SFLOAT:
++			internalFormat = GL_DEPTH_COMPONENT32F;
++			pixelFormat = GL_DEPTH_COMPONENT;
++			pixelType = GL_FLOAT;
++			break;
++		case Format::D24_UNORM_S8_UINT:
++			internalFormat = GL_DEPTH24_STENCIL8;
++			pixelFormat = GL_DEPTH_STENCIL;
++			pixelType = GL_UNSIGNED_INT_24_8;
++			break;
++#elif CONFIG2_GLES
+ 		// GLES requires pixel type == UNSIGNED_SHORT or UNSIGNED_INT for depth.
+ 		case Format::D16_UNORM: FALLTHROUGH;
+ 		case Format::D24_UNORM: FALLTHROUGH;
+
+--- a/source/scriptinterface/FunctionWrapper.h	2025-04-28 20:20:25.000000000 +0000
++++ b/source/scriptinterface/FunctionWrapper.h	2026-10-16 13:45:26.429325438 +0000
+@@ -380,11 +380,11 @@
+ 				return iteratorResult;
+ 			};
+ 
+-		JS::PersistentRootedValue error{rq.cx, JS::UndefinedValue()};
++		JS::RootedValue error{rq.cx, JS::UndefinedValue()};
+ 		while (true)
+ 		{
+ 			JS::RootedValue iteratorResult{rq.cx, error.isUndefined() ? continueGenerator("next") :
+-				continueGenerator("throw", std::exchange(error, JS::UndefinedValue()))};
++				continueGenerator("throw", [&] { JS::Value old = error; error = JS::UndefinedValue(); return old; }())};
+ 
+ 			try
+ 			{
+
+--- a/source/scriptinterface/Promises.cpp	2025-04-28 20:20:25.000000000 +0000
++++ b/source/scriptinterface/Promises.cpp	2026-10-16 13:47:04.501513629 +0000
+@@ -28,14 +28,13 @@
+ namespace Script
+ {
+ 
+-void UnhandledRejectedPromise(JSContext* cx, bool, JS::HandleObject promise,
+-	JS::PromiseRejectionHandlingState state, void*)
++void UnhandledRejectedPromise(JSContext* cx, JSValue, JSValue reasonRaw, bool isHandled, void*)
+ {
+-	if (state == JS::PromiseRejectionHandlingState::Handled)
++	if (isHandled || !JS_GetContextOpaque(cx))
+ 		return;
+ 
+ 	const ScriptRequest rq{cx};
+-	JS::RootedValue reason(cx, JS::GetPromiseResult(promise));
++	JS::RootedValue reason(cx, JS::Value{reasonRaw});
+ 
+ 	std::string asString;
+ 	ScriptFunction::Call(rq, reason, "toString", asString);
+@@ -44,73 +43,23 @@
+ 	LOGERROR("An unhandled promise got rejected:\n%s\n%s", asString, stack);
+ }
+ 
+-void JobQueue::runJobs(JSContext*)
++void JobQueue::runJobs(JSContext* cx)
+ {
+-	while (!m_Jobs.empty())
++	JSRuntime* rt = JS_GetRuntime(cx);
++	JSContext* jobCx = nullptr;
++	while (JS_IsJobPending(rt))
+ 	{
+-		QueueElement& element = m_Jobs.front();
+-		ScriptRequest rq{element.scriptInterface};
+-		JS::RootedObject localJob{rq.cx, element.job};
+-		m_Jobs.pop();
+-
+-		JS::RootedValue globV{rq.cx, rq.globalValue()};
+-		JS::RootedValue rval{rq.cx};
+-		JS::Call(rq.cx, globV, localJob, JS::HandleValueArray::empty(), &rval);
+-	}
+-}
+-
+-JSObject* JobQueue::getIncumbentGlobal(JSContext* cx)
+-{
+-	return JS::CurrentGlobalOrNull(cx);
+-}
+-
+-bool JobQueue::enqueuePromiseJob(JSContext* cx, JS::HandleObject, JS::HandleObject job, JS::HandleObject,
+-	JS::HandleObject)
+-{
+-	try
+-	{
+-		m_Jobs.push({ScriptRequest{cx}.GetScriptInterface(), JS::PersistentRootedObject{cx, job}});
+-		return true;
+-	}
+-	catch (...)
+-	{
+-		return false;
+-	}
+-}
++		const int ret = JS_ExecutePendingJob(rt, &jobCx);
++		if (ret >= 0)
++			continue;
+ 
+-bool JobQueue::empty() const
+-{
+-	return m_Jobs.empty();
+-}
+-
+-js::UniquePtr<JS::JobQueue::SavedJobQueue> JobQueue::saveJobQueue(JSContext*)
+-{
+-	class SavedJobQueue final : public JS::JobQueue::SavedJobQueue
+-	{
+-	public:
+-		SavedJobQueue(QueueType& queue) :
+-			externQueue{queue},
+-			internQueue{std::move(queue)}
+-		{}
+-
+-		~SavedJobQueue() final
++		if (jobCx && JS_GetContextOpaque(jobCx))
+ 		{
+-			ENSURE(externQueue.empty());
+-			externQueue = std::move(internQueue);
++			const ScriptRequest rq{jobCx};
++			ScriptException::CatchPending(rq);
+ 		}
+-
+-	private:
+-		QueueType& externQueue;
+-		QueueType internQueue;
+-	};
+-
+-	try
+-	{
+-		return js::MakeUnique<SavedJobQueue>(m_Jobs);
+-	}
+-	catch (...)
+-	{
+-		return nullptr;
++		else if (jobCx)
++			JS_ClearPendingException(jobCx);
+ 	}
+ }
+ 
+
+--- a/source/scriptinterface/Promises.h	2025-04-28 20:20:25.000000000 +0000
++++ b/source/scriptinterface/Promises.h	2026-10-16 13:47:04.503961314 +0000
+@@ -18,48 +18,24 @@
+ #ifndef INCLUDED_SCRIPTINTERFACE_JOBQUEUE
+ #define INCLUDED_SCRIPTINTERFACE_JOBQUEUE
+ 
+-#if MSC_VERSION
+-# pragma warning(push, 1)
+-# pragma warning(disable: 4068)
+-#endif
+-#include "js/Promise.h"
+-#if MSC_VERSION
+-# pragma warning(pop)
+-#endif
+-
+-#include <queue>
++#include "scriptinterface/ScriptTypes.h"
+ 
+ class ScriptInterface;
+ 
+ namespace Script
+ {
+-void UnhandledRejectedPromise(JSContext* cx, bool, JS::HandleObject promise,
+-	JS::PromiseRejectionHandlingState state, void*);
+-
+-class JobQueue final : public JS::JobQueue
++/**
++ * Promise rejection tracker, installed with JS_SetHostPromiseRejectionTracker.
++ */
++void UnhandledRejectedPromise(JSContext* cx, JSValue promise, JSValue reason, bool isHandled, void*);
++
++/**
++ * QuickJS keeps its own promise job queue per runtime; this only drains it.
++ */
++class JobQueue
+ {
+ public:
+-	~JobQueue() final = default;
+-
+-	void runJobs(JSContext*) final;
+-
+-private:
+-	JSObject* getIncumbentGlobal(JSContext* cx) final;
+-
+-	bool enqueuePromiseJob(JSContext* cx, JS::HandleObject, JS::HandleObject job, JS::HandleObject,
+-		JS::HandleObject) final;
+-
+-	bool empty() const final;
+-
+-	js::UniquePtr<JS::JobQueue::SavedJobQueue> saveJobQueue(JSContext*) final;
+-
+-	struct QueueElement
+-	{
+-		const ScriptInterface& scriptInterface;
+-		JS::PersistentRootedObject job;
+-	};
+-	using QueueType = std::queue<QueueElement>;
+-	QueueType m_Jobs;
++	void runJobs(JSContext* cx);
+ };
+ }
+ 
+
+--- a/source/scriptinterface/ScriptContext.cpp	2025-07-14 14:31:47.000000000 +0000
++++ b/source/scriptinterface/ScriptContext.cpp	2026-10-16 13:56:02.598238187 +0000
+@@ -27,67 +27,6 @@
+ #include "scriptinterface/ScriptEngine.h"
+ #include "scriptinterface/ScriptInterface.h"
+ 
+-#include "js/friend/PerformanceHint.h"
+-
+-void GCSliceCallbackHook(JSContext* UNUSED(cx), JS::GCProgress progress, const JS::GCDescription& UNUSED(desc))
+-{
+-	/**
+-	 * From the GCAPI.h file:
+-	 * > During GC, the GC is bracketed by GC_CYCLE_BEGIN/END callbacks. Each
+-	 * > slice between those (whether an incremental or the sole non-incremental
+-	 * > slice) is bracketed by GC_SLICE_BEGIN/GC_SLICE_END.
+-	 * Thus, to safely monitor GCs, we need to profile SLICE_X calls.
+-	 */
+-
+-
+-	if (progress == JS::GC_SLICE_BEGIN)
+-	{
+-		if (CProfileManager::IsInitialised() && Threading::IsMainThread())
+-			g_Profiler.Start("GCSlice");
+-		g_Profiler2.RecordRegionEnter("GCSlice");
+-	}
+-	else if (progress == JS::GC_SLICE_END)
+-	{
+-		if (CProfileManager::IsInitialised() && Threading::IsMainThread())
+-			g_Profiler.Stop();
+-		g_Profiler2.RecordRegionLeave();
+-	}
+-
+-	// The following code can be used to print some information aobut garbage collection
+-	// Search for "Nonincremental reason" if there are problems running GC incrementally.
+-	#if 0
+-	if (progress == JS::GCProgress::GC_CYCLE_BEGIN)
+-		printf("starting cycle ===========================================\n");
+-
+-	//const char16_t* str = desc.formatMessage(cx);
+-	const char16_t* str = desc.formatSliceMessage(cx);
+-	int len = 0;
+-
+-	for(int i = 0; i < 10000; i++)
+-	{
+-		len++;
+-		if(!str[i])
+-			break;
+-	}
+-
+-	wchar_t outstring[len];
+-
+-	for(int i = 0; i < len; i++)
+-	{
+-		outstring[i] = (wchar_t)str[i];
+-	}
+-
+-	printf("---------------------------------------\n: %ls \n---------------------------------------\n", outstring);
+-
+-	const uint32_t gcBytes = JS_GetGCParameter(cx, JSGC_BYTES);
+-
+-	printf("gcBytes: %i KB\n", gcBytes / 1024);
+-
+-	if (progress == JS::GCProgress::GC_SLICE_END)
+-		printf("ending cycle ===========================================\n");
+-	#endif
+-}
+-
+ std::shared_ptr<ScriptContext> ScriptContext::CreateContext(int contextSize, uint32_t heapGrowthBytesGCTrigger)
+ {
+ 	return std::make_shared<ScriptContext>(contextSize, heapGrowthBytesGCTrigger);
+@@ -100,164 +39,65 @@
+ {
+ 	ENSURE(ScriptEngine::IsInitialised() && "The ScriptEngine must be initialized before constructing any ScriptContexts!");
+ 
+-	m_cx = JS_NewContext(contextSize);
+-	ENSURE(m_cx); // TODO: error handling
+-
+-	// Set stack quota limits - JS scripts will stop with a "too much recursion" exception.
+-	// This seems to refer to the program's actual stack size, so it should be lower than the lowest common denominator
+-	// of the various stack sizes of supported OS.
+-	// From SM78's jsapi.h:
+-	// - "The stack quotas for each kind of code should be monotonically descending"
+-	// - "This function may only be called immediately after the runtime is initialized
+-	//   and before any code is executed and/or interrupts requested"
+-	JS_SetNativeStackQuota(m_cx, 950 * KiB, 900 * KiB, 850 * KiB);
+-
+-	ENSURE(JS::InitSelfHostedCode(m_cx));
+-
+-	JS::SetGCSliceCallback(m_cx, GCSliceCallbackHook);
+-
+-	JS_SetGCParameter(m_cx, JSGC_MAX_BYTES, m_ContextSize);
+-	JS_SetGCParameter(m_cx, JSGC_INCREMENTAL_GC_ENABLED, true);
+-	JS_SetGCParameter(m_cx, JSGC_PER_ZONE_GC_ENABLED, false);
+-
+-	// Set a low time budget to avoid lag spikes, but allow any number of last ditch GCs
+-	// to avoid OOM errors.
+-	JS_SetGCParameter(m_cx, JSGC_SLICE_TIME_BUDGET_MS, 10);
+-	JS_SetGCParameter(m_cx, JSGC_MIN_LAST_DITCH_GC_PERIOD, 0);
+-
+-
+-	JS_SetOffthreadIonCompilationEnabled(m_cx, true);
+-
+-	// For GC debugging:
+-	// JS_SetGCZeal(m_cx, 2, JS_DEFAULT_ZEAL_FREQ);
+-
+-	JS_SetContextPrivate(m_cx, nullptr);
+-
+-	JS_SetGlobalJitCompilerOption(m_cx, JSJITCOMPILER_ION_ENABLE, 1);
+-	JS_SetGlobalJitCompilerOption(m_cx, JSJITCOMPILER_BASELINE_ENABLE, 1);
+-
+-	// Turn off Spectre mitigations - this is a huge speedup on JS code, particularly JS -> C++ calls.
+-	JS_SetGlobalJitCompilerOption(m_cx, JSJITCOMPILER_SPECTRE_JIT_TO_CXX_CALLS, 0);
+-	JS_SetGlobalJitCompilerOption(m_cx, JSJITCOMPILER_SPECTRE_INDEX_MASKING, 0);
+-	JS_SetGlobalJitCompilerOption(m_cx, JSJITCOMPILER_SPECTRE_VALUE_MASKING, 0);
+-	JS_SetGlobalJitCompilerOption(m_cx, JSJITCOMPILER_SPECTRE_STRING_MITIGATIONS, 0);
+-	JS_SetGlobalJitCompilerOption(m_cx, JSJITCOMPILER_SPECTRE_OBJECT_MITIGATIONS, 0);
+-
+-	JS::ContextOptionsRef(m_cx).setStrictMode(true);
+-
+-	// Workaround to turn off nursery size heuristic.
+-	// See https://gitea.wildfiregames.com/0ad/0ad/issues/7714 for details.
+-	js::gc::SetPerformanceHint(m_cx, js::gc::PerformanceHint::InPageLoad);
++	// QuickJS port: one JSRuntime per ScriptContext; every ScriptInterface gets its own JSContext in it.
++	m_rt = JS_NewRuntime();
++	ENSURE(m_rt); // TODO: error handling
++
++	// QuickJS counts malloc'd bytes (not the GC heap), so leave generous headroom over the SpiderMonkey figure.
++	JS_SetMemoryLimit(m_rt, static_cast<size_t>(m_ContextSize) * 8);
++	JS_SetMaxStackSize(m_rt, 900 * KiB);
++
++	m_cx = JS_NewContext(m_rt);
++	ENSURE(m_cx);
++	JSShim_SetGlobalCx(m_cx);
+ 
+ 	ScriptEngine::GetSingleton().RegisterContext(m_cx);
+ 
+-	JS::SetJobQueue(m_cx, m_JobQueue.get());
+-	JS::SetPromiseRejectionTrackerCallback(m_cx, &Script::UnhandledRejectedPromise);
++	JS_SetHostPromiseRejectionTracker(m_rt, &Script::UnhandledRejectedPromise, nullptr);
+ }
+ 
+ ScriptContext::~ScriptContext()
+ {
+ 	ENSURE(ScriptEngine::IsInitialised() && "The ScriptEngine must be active (initialized and not yet shut down) when destroying a ScriptContext!");
+ 
+-	// Switch back to normal performance mode to avoid assertion in debug mode.
+-	js::gc::SetPerformanceHint(m_cx, js::gc::PerformanceHint::Normal);
+-
+-	JS_DestroyContext(m_cx);
++	JSShim_PoolRelease(m_cx);
+ 	ScriptEngine::GetSingleton().UnRegisterContext(m_cx);
++	JS_FreeContext(m_cx);
++	JS_FreeRuntime(m_rt);
+ }
+ 
++// QuickJS has no realms/zones; these are kept for API compatibility.
+ void ScriptContext::RegisterRealm(JS::Realm* realm)
+ {
+-	ENSURE(realm);
+ 	m_Realms.push_back(realm);
+ }
+ 
+ void ScriptContext::UnRegisterRealm(JS::Realm* realm)
+ {
+-	// Schedule the zone for GC, which will destroy the realm.
+-	if (JS::IsIncrementalGCInProgress(m_cx))
+-		JS::FinishIncrementalGC(m_cx, JS::GCReason::API);
+-	JS::PrepareZoneForGC(m_cx, js::GetRealmZone(realm));
+ 	m_Realms.remove(realm);
+ }
+ 
+-#define GC_DEBUG_PRINT 0
+ void ScriptContext::MaybeIncrementalGC()
+ {
+ 	PROFILE2("MaybeIncrementalGC");
+ 
+-	if (!JS::IsIncrementalGCEnabled(m_cx))
+-		return;
+-
+-	// The idea is to get the heap size after a completed GC and trigger the next GC
+-	// when the heap size has reached m_LastGCBytes + X.
+-	// Spidermonkey allocates memory arenas of 4KB for JS heap data.
+-	// At the end of a GC, any such arena that became empty is freed.
+-	// On shrinking GCs, spidermonkey further defragments the arenas, which effectively frees more memory but costs time.
+-	// In practice, shrinking GCs also dump JITted code and the defragmentation is not worth it for 0 A.D.
+-	// The regular GCs also free quite a bit of memory anyways, and non-full arenas get used for new objects.
+-
+-	const uint32_t gcBytes = JS_GetGCParameter(m_cx, JSGC_BYTES);
+-
+-#if GC_DEBUG_PRINT
+-	printf("gcBytes: %i KB, last of %i KB\n", gcBytes / 1024, m_LastGCBytes / 1024);
+-#endif
+-
+-	// The memory freeing happens mostly in the background, so we can't rely on the value on the last incremental slice.
+-	// To fix that, just remember a 'minimum' value.
++	// QuickJS frees most garbage immediately through reference counting; the cycle collector only
++	// needs to run when memory has grown noticeably since the last collection.
++	int gcBytes = JS_GetGCParameter(m_cx, JSGC_BYTES);
+ 	if (m_LastGCBytes > gcBytes || m_LastGCBytes == 0)
+-	{
+-#if GC_DEBUG_PRINT
+-		printf("Setting m_LastGCBytes: %d KB \n", gcBytes / 1024);
+-#endif
+ 		m_LastGCBytes = gcBytes;
+-	}
+ 
+-	// Run an additional incremental GC slice if the currently running incremental GC isn't over yet
+-	// ... or
+-	// start a new incremental GC if the JS heap size has grown enough for a GC to make sense
+-	if (JS::IsIncrementalGCInProgress(m_cx) || (gcBytes - m_LastGCBytes > m_HeapGrowthBytesGCTrigger))
++	if (gcBytes - m_LastGCBytes > m_HeapGrowthBytesGCTrigger)
+ 	{
+-#if GC_DEBUG_PRINT
+-		if (JS::IsIncrementalGCInProgress(m_cx))
+-			printf("An incremental GC cycle is in progress. \n");
+-		else
+-			printf("GC needed because JSGC_BYTES - m_LastGCBytes > m_HeapGrowthBytesGCTrigger \n"
+-				"    JSGC_BYTES: %d KB \n    m_LastGCBytes: %d KB \n    m_HeapGrowthBytesGCTrigger: %d KB \n",
+-				gcBytes / 1024,
+-				m_LastGCBytes / 1024,
+-				m_HeapGrowthBytesGCTrigger / 1024);
+-#endif
+-
+-#if GC_DEBUG_PRINT
+-		if (!JS::IsIncrementalGCInProgress(m_cx))
+-			printf("Starting incremental GC \n");
+-		else
+-			printf("Running incremental GC slice \n");
+-#endif
+-
+-		// There is a tradeoff between this time and the number of frames we must run GCs on, but overall we should prioritize smooth framerates.
+-		const js::SliceBudget GCSliceTimeBudget = js::SliceBudget(js::TimeBudget(6)); // Milliseconds an incremental slice is allowed to run. SM respects this fairly well.
+-
+-		PrepareZonesForIncrementalGC();
+-		if (!JS::IsIncrementalGCInProgress(m_cx))
+-			JS::StartIncrementalGC(m_cx, JS::GCOptions::Normal, JS::GCReason::API, GCSliceTimeBudget);
+-		else
+-			JS::IncrementalGCSlice(m_cx, JS::GCReason::API, GCSliceTimeBudget);
+-
+-		// Reset this here so that the minimum gets cleared.
+-		m_LastGCBytes = gcBytes;
++		JS_RunGC(m_rt);
++		m_LastGCBytes = JS_GetGCParameter(m_cx, JSGC_BYTES);
+ 	}
+ }
+ 
+ void ScriptContext::ShrinkingGC()
+ {
+-	JS_SetGCParameter(m_cx, JSGC_INCREMENTAL_GC_ENABLED, false);
+-	JS_SetGCParameter(m_cx, JSGC_PER_ZONE_GC_ENABLED, true);
+-	JS::PrepareForFullGC(m_cx);
+-	JS::NonIncrementalGC(m_cx, JS::GCOptions::Shrink, JS::GCReason::API);
+-	JS_SetGCParameter(m_cx, JSGC_INCREMENTAL_GC_ENABLED, true);
+-	JS_SetGCParameter(m_cx, JSGC_PER_ZONE_GC_ENABLED, false);
++	JS_RunGC(m_rt);
++	m_LastGCBytes = JS_GetGCParameter(m_cx, JSGC_BYTES);
+ }
+ 
+ void ScriptContext::RunJobs()
+@@ -267,6 +107,4 @@
+ 
+ void ScriptContext::PrepareZonesForIncrementalGC() const
+ {
+-	for (JS::Realm* const& realm : m_Realms)
+-		JS::PrepareZoneForGC(m_cx, js::GetRealmZone(realm));
+ }
+
+--- a/source/scriptinterface/ScriptContext.h	2025-07-14 14:31:47.000000000 +0000
++++ b/source/scriptinterface/ScriptContext.h	2026-10-16 13:47:04.508483527 +0000
+@@ -101,9 +101,11 @@
+ 	 * ScriptRequest and use the context from that.
+ 	 */
+ 	JSContext* GetGeneralJSContext() const { return m_cx; }
++	JSRuntime* GetRuntime() const { return m_rt; }
+ 
+ private:
+ 
++	JSRuntime* m_rt;
+ 	JSContext* m_cx;
+ 	const std::unique_ptr<Script::JobQueue> m_JobQueue;
+ 
+
+--- a/source/scriptinterface/ScriptConversions.cpp	2025-04-28 20:20:25.000000000 +0000
++++ b/source/scriptinterface/ScriptConversions.cpp	2026-10-16 13:45:26.429761609 +0000
+@@ -105,26 +105,7 @@
+ 	if (!str)
+ 		FAIL("Argument must be convertible to a string");
+ 
+-	if (JS::StringHasLatin1Chars(str))
+-	{
+-		size_t length;
+-		JS::AutoCheckCannotGC nogc;
+-		const JS::Latin1Char* ch = JS_GetLatin1StringCharsAndLength(rq.cx, nogc, str, &length);
+-		if (!ch)
+-			FAIL("JS_GetLatin1StringCharsAndLength failed");
+-
+-		out.assign(ch, ch + length);
+-	}
+-	else
+-	{
+-		size_t length;
+-		JS::AutoCheckCannotGC nogc;
+-		const char16_t* ch = JS_GetTwoByteStringCharsAndLength(rq.cx, nogc, str, &length);
+-		if (!ch)
+-			FAIL("JS_GetTwoByteStringsCharsAndLength failed"); // out of memory
+-
+-		out.assign(ch, ch + length);
+-	}
++	out = JSShim_StringToWString(rq.cx, str);
+ 	return true;
+ }
+ 
+
+--- a/source/scriptinterface/ScriptConversions.h	2025-04-28 20:20:25.000000000 +0000
++++ b/source/scriptinterface/ScriptConversions.h	2026-10-16 13:45:26.429796339 +0000
+@@ -65,6 +65,12 @@
+ 	handle.set(a);
+ }
+ 
++template<>
++inline void ToJSVal<JS::Value>(const ScriptRequest& UNUSED(rq), JS::MutableHandleValue handle, const JS::Value& a)
++{
++	handle.set(a);
++}
++
+ /**
+  * Convert a named property of an object to a C++ type.
+  */
+
+--- a/source/scriptinterface/ScriptExceptions.cpp	2025-04-28 20:20:25.000000000 +0000
++++ b/source/scriptinterface/ScriptExceptions.cpp	2026-10-16 13:45:26.429809929 +0000
+@@ -55,9 +55,15 @@
+ 	}
+ 
+ 	JS::RootedObject excnObj(rq.cx, &excn.toObject());
+-	JSErrorReport* report = JS_ErrorFromException(rq.cx, excnObj);
+ 
+-	if (!report)
++	// QuickJS port: error details are plain properties of the Error object.
++	JS::RootedValue messageVal(rq.cx), fileVal(rq.cx), lineVal(rq.cx), stackVal(rq.cx);
++	JS_GetProperty(rq.cx, excnObj, "message", &messageVal);
++	JS_GetProperty(rq.cx, excnObj, "fileName", &fileVal);
++	JS_GetProperty(rq.cx, excnObj, "lineNumber", &lineVal);
++	JS_GetProperty(rq.cx, excnObj, "stack", &stackVal);
++
++	if (messageVal.isUndefined())
+ 	{
+ 		CStr error;
+ 		Script::FromJSVal(rq, excn, error);
+@@ -67,22 +73,18 @@
+ 
+ 	std::stringstream msg;
+ 	msg << "JavaScript error: ";
+-	if (report->filename)
++	CStr file, message, stackText;
++	if (!fileVal.isUndefined() && Script::FromJSVal(rq, fileVal, file) && !file.empty())
+ 	{
+-		msg << report->filename;
+-		msg << " line " << report->lineno << "\n";
++		int line = 0;
++		Script::FromJSVal(rq, lineVal, line);
++		msg << file << " line " << line << "\n";
+ 	}
++	Script::FromJSVal(rq, messageVal, message);
++	msg << message;
+ 
+-	msg << report->message().c_str();
+-
+-	JS::RootedObject stackObj(rq.cx, ExceptionStackOrNull(excnObj));
+-	JS::RootedValue stackVal(rq.cx, JS::ObjectOrNullValue(stackObj));
+-
+-	if (!stackVal.isNull())
++	if (!stackVal.isUndefined() && Script::FromJSVal(rq, stackVal, stackText))
+ 	{
+-		std::string stackText;
+-		ScriptFunction::Call(rq, stackVal, "toString", stackText);
+-
+ 		std::istringstream stream(stackText);
+ 		for (std::string line; std::getline(stream, line);)
+ 			msg << "\n  " << line;
+
+--- a/source/scriptinterface/ScriptInterface.cpp	2025-04-28 20:20:25.000000000 +0000
++++ b/source/scriptinterface/ScriptInterface.cpp	2026-10-16 13:47:04.511009705 +0000
+@@ -52,7 +52,7 @@
+ 
+ struct ScriptInterface_impl
+ {
+-	ScriptInterface_impl(const char* nativeScopeName, ScriptContext& context, JS::Compartment* compartment);
++	ScriptInterface_impl(const char* nativeScopeName, ScriptContext& context);
+ 	~ScriptInterface_impl();
+ 
+ 	// Take care to keep this declaration before heap rooted members. Destructors of heap rooted
+@@ -78,12 +78,13 @@
+ 	nativeScope(scriptInterface.m->m_nativeScope),
+ 	m_ScriptInterface(scriptInterface)
+ {
+-	m_FormerRealm = JS::EnterRealm(cx, scriptInterface.m->m_glob);
++	m_FormerRealm = nullptr;
++	JSShim_RequestEnter();
+ }
+ 
+ ScriptRequest::~ScriptRequest()
+ {
+-	JS::LeaveRealm(cx, m_FormerRealm);
++	JSShim_RequestLeave(cx);
+ }
+ 
+ ScriptRequest::ScriptRequest(JSContext* cx) : ScriptRequest(ScriptInterface::CmptPrivate::GetScriptInterface(cx))
+@@ -103,18 +104,6 @@
+ namespace
+ {
+ 
+-JSClassOps global_classops = {
+-	nullptr, nullptr,
+-	nullptr, nullptr,
+-	nullptr, nullptr, nullptr,
+-	nullptr, nullptr,
+-	JS_GlobalObjectTraceHook
+-};
+-
+-JSClass global_class = {
+-	"global", JSCLASS_GLOBAL_FLAGS, &global_classops
+-};
+-
+ // Functions in the global namespace:
+ 
+ bool print(JSContext* cx, uint argc, JS::Value* vp)
+@@ -300,32 +289,18 @@
+ 	return true;
+ }
+ 
+-ScriptInterface_impl::ScriptInterface_impl(const char* nativeScopeName, ScriptContext& context,
+-	JS::Compartment* compartment) :
+-	m_context(context), m_cx(context.GetGeneralJSContext()), m_glob(context.GetGeneralJSContext()),
+-	m_nativeScope(context.GetGeneralJSContext())
+-{
+-	JS::RealmCreationOptions creationOpt;
+-	// Keep JIT code during non-shrinking GCs. This brings a quite big performance improvement.
+-	creationOpt.setPreserveJitCode(true);
+-	// Enable uneval
+-	creationOpt.setToSourceEnabled(true);
+-
+-	if (compartment)
+-		creationOpt.setExistingCompartment(compartment);
+-	else
+-		// This is the default behaviour.
+-		creationOpt.setNewCompartmentAndZone();
+-
+-	JS::RealmOptions opt(creationOpt, JS::RealmBehaviors{});
+-
+-	m_glob = JS_NewGlobalObject(m_cx, &global_class, nullptr, JS::OnNewGlobalHookOption::FireOnNewGlobalHook, opt);
+-
+-	JSAutoRealm autoRealm(m_cx, m_glob);
+-
+-	ENSURE(JS::InitRealmStandardClasses(m_cx));
++ScriptInterface_impl::ScriptInterface_impl(const char* nativeScopeName, ScriptContext& context) :
++	m_context(context), m_cx(JS_NewContext(context.GetRuntime())), m_glob(m_cx),
++	m_nativeScope(m_cx)
++{
++	// QuickJS port: each interface is a JSContext of the shared runtime; the context's global
++	// object (with the standard classes already set up) plays the role of the realm global.
++	ENSURE(m_cx);
++	JS_SetContextOpaque(m_cx, nullptr);
++	m_glob = JSShim_GlobalObject(m_cx);
++	JSShim_InstallPrelude(m_cx);
+ 
+-	JS_DefineProperty(m_cx, m_glob, "global", m_glob, JSPROP_ENUMERATE | JSPROP_READONLY | JSPROP_PERMANENT);
++	JS_DefineProperty(m_cx, m_glob, "global", JS::HandleObject(m_glob), JSPROP_ENUMERATE | JSPROP_READONLY | JSPROP_PERMANENT);
+ 
+ 	// These first 4 actually use CallArgs & thus don't use ScriptFunction
+ 	JS_DefineFunction(m_cx, m_glob, "print", ::print,        0, JSPROP_ENUMERATE | JSPROP_READONLY | JSPROP_PERMANENT);
+@@ -341,16 +316,16 @@
+ 	ScriptFunction::Register<&ProfileStop>(m_cx, m_nativeScope, "ProfileStop");
+ 	ScriptFunction::Register<&ProfileAttribute>(m_cx, m_nativeScope, "ProfileAttribute");
+ 
+-	m_context.RegisterRealm(JS::GetObjectRealmOrNull(m_glob));
+ }
+ 
+ ScriptInterface_impl::~ScriptInterface_impl()
+ {
+-	m_context.UnRegisterRealm(JS::GetObjectRealmOrNull(m_glob));
++	JSShim_PoolRelease(m_cx);
++	JS_FreeContext(m_cx);
+ }
+ 
+ ScriptInterface::ScriptInterface(const char* nativeScopeName, const char* debugName, ScriptContext& context) :
+-	m(std::make_unique<ScriptInterface_impl>(nativeScopeName, context, nullptr))
++	m(std::make_unique<ScriptInterface_impl>(nativeScopeName, context))
+ {
+ 	// Profiler stats table isn't thread-safe, so only enable this on the main thread
+ 	if (Threading::IsMainThread())
+@@ -361,14 +336,12 @@
+ 
+ 	ScriptRequest rq(this);
+ 	m_CmptPrivate.pScriptInterface = this;
+-	JS::SetRealmPrivate(JS::GetObjectRealmOrNull(rq.glob), (void*)&m_CmptPrivate);
++	JS_SetContextOpaque(rq.cx, (void*)&m_CmptPrivate);
+ }
+ 
+ ScriptInterface::ScriptInterface(const char* nativeScopeName, const char* debugName, const ScriptInterface& neighbor)
+ {
+-	ScriptRequest nrq(neighbor);
+-	JS::Compartment* comp = JS::GetCompartmentForRealm(JS::GetCurrentRealmOrNull(nrq.cx));
+-	m = std::make_unique<ScriptInterface_impl>(nativeScopeName, neighbor.GetContext(), comp);
++	m = std::make_unique<ScriptInterface_impl>(nativeScopeName, neighbor.GetContext());
+ 
+ 	// Profiler stats table isn't thread-safe, so only enable this on the main thread
+ 	if (Threading::IsMainThread())
+@@ -379,7 +352,7 @@
+ 
+ 	ScriptRequest rq(this);
+ 	m_CmptPrivate.pScriptInterface = this;
+-	JS::SetRealmPrivate(JS::GetObjectRealmOrNull(rq.glob), (void*)&m_CmptPrivate);
++	JS_SetContextOpaque(rq.cx, (void*)&m_CmptPrivate);
+ }
+ 
+ ScriptInterface::~ScriptInterface()
+@@ -394,14 +367,14 @@
+ 
+ const ScriptInterface& ScriptInterface::CmptPrivate::GetScriptInterface(JSContext *cx)
+ {
+-	CmptPrivate* pCmptPrivate = (CmptPrivate*)JS::GetRealmPrivate(JS::GetCurrentRealmOrNull(cx));
++	CmptPrivate* pCmptPrivate = (CmptPrivate*)JS_GetContextOpaque(cx);
+ 	ENSURE(pCmptPrivate);
+ 	return *pCmptPrivate->pScriptInterface;
+ }
+ 
+ void* ScriptInterface::CmptPrivate::GetCBData(JSContext *cx)
+ {
+-	CmptPrivate* pCmptPrivate = (CmptPrivate*)JS::GetRealmPrivate(JS::GetCurrentRealmOrNull(cx));
++	CmptPrivate* pCmptPrivate = (CmptPrivate*)JS_GetContextOpaque(cx);
+ 	return pCmptPrivate ? pCmptPrivate->pCBData : nullptr;
+ }
+ 
+@@ -537,11 +510,11 @@
+ 		return false;
+ 	if (found)
+ 	{
+-		JS::Rooted<mozilla::Maybe<JS::PropertyDescriptor>> desc(rq.cx);
+-		if (!JS_GetOwnPropertyDescriptor(rq.cx, global, name, &desc) || !desc.isSome())
++		bool propFound, writable, configurable;
++		if (!JSShim_GetOwnPropFlags(rq.cx, global, name, &propFound, &writable, &configurable) || !propFound)
+ 			return false;
+ 
+-		if (!desc->writable())
++		if (!writable)
+ 		{
+ 			if (!replace)
+ 			{
+@@ -551,7 +524,7 @@
+ 
+ 			// This is not supposed to happen, unless the user has called SetProperty with constant = true on the global object
+ 			// instead of using SetGlobal.
+-			if (!desc->configurable())
++			if (!configurable)
+ 			{
+ 				ScriptException::Raise(rq, "The global \"%s\" is permanent and cannot be hotloaded", name);
+ 				return false;
+@@ -587,8 +560,7 @@
+ 	// Some objects, such as const definitions, or Class definitions, are hidden inside closures.
+ 	// We must fetch those from the correct lexical scope.
+ 	//JS::RootedValue glob(cx);
+-	JS::RootedObject lexical_environment(rq.cx, JS_GlobalLexicalEnvironment(rq.glob));
+-	if (!JS_GetProperty(rq.cx, lexical_environment, name.c_str(), out))
++	if (!JSShim_EvalGlobalName(rq.cx, name.c_str(), out))
+ 	{
+ 		out.set(JS::NullHandleValue);
+ 		return false;
+
+--- a/source/scriptinterface/StructuredClone.cpp	2025-04-28 20:20:25.000000000 +0000
++++ b/source/scriptinterface/StructuredClone.cpp	2026-10-16 13:45:26.429871173 +0000
+@@ -42,23 +42,33 @@
+ 
+ Script::StructuredClone Script::WriteStructuredClone(const ScriptRequest& rq, JS::HandleValue v)
+ {
+-	Script::StructuredClone ret(new JSStructuredCloneData(JS::StructuredCloneScope::SameProcess));
+-	JS::CloneDataPolicy policy;
+-	if (!JS_WriteStructuredClone(rq.cx, v, ret.get(), JS::StructuredCloneScope::SameProcess, policy, nullptr, nullptr, JS::UndefinedHandleValue))
++	// QuickJS port: serialise with the engine's object writer (keeps shared/cyclic references).
++	size_t size = 0;
++	uint8_t* data = JS_WriteObject(rq.cx, &size, v.get().raw(), JS_WRITE_OBJ_REFERENCE);
++	if (!data)
+ 	{
+-		debug_warn(L"Writing a structured clone with JS_WriteStructuredClone failed!");
++		debug_warn(L"Writing a structured clone with JS_WriteObject failed!");
+ 		ScriptException::CatchPending(rq);
+ 		return StructuredClone();
+ 	}
+ 
++	Script::StructuredClone ret(new JSStructuredCloneData);
++	ret->buf.assign(data, data + size);
++	js_free(rq.cx, data);
+ 	return ret;
+ }
+ 
+ void Script::ReadStructuredClone(const ScriptRequest& rq, const Script::StructuredClone& ptr, JS::MutableHandleValue ret)
+ {
+-	JS::CloneDataPolicy policy;
+-	if (!JS_ReadStructuredClone(rq.cx, *ptr, JS_STRUCTURED_CLONE_VERSION, ptr->scope(), ret, policy, nullptr, nullptr))
++	JSValue val = JS_ReadObject(rq.cx, ptr->buf.data(), ptr->buf.size(), JS_READ_OBJ_REFERENCE);
++	if (JS_IsException(val))
++	{
+ 		ScriptException::CatchPending(rq);
++		return;
++	}
++	if (JS_VALUE_HAS_REF_COUNT(val))
++		JSShim_Pool(rq.cx, val);
++	ret.set(JS::Value{val});
+ }
+ 
+ JS::Value Script::CloneValueFromOtherCompartment(const ScriptInterface& to, const ScriptInterface& from, JS::HandleValue val)
+
+--- a/source/scriptinterface/StructuredClone.h	2025-04-28 20:20:25.000000000 +0000
++++ b/source/scriptinterface/StructuredClone.h	2026-10-16 13:45:26.429898631 +0000
+@@ -22,7 +22,7 @@
+ 
+ #include <memory>
+ 
+-class JSStructuredCloneData;
++struct JSStructuredCloneData;
+ 
+ namespace Script
+ {
+
+--- a/source/soundmanager/SoundManager.cpp	2025-04-28 20:20:25.000000000 +0000
++++ b/source/soundmanager/SoundManager.cpp	2026-10-16 14:26:09.255926241 +0000
+@@ -839,6 +839,12 @@
+ 			devices = alcGetString(nullptr, ALC_DEVICE_SPECIFIER);
+ 	}
+ 
++#if defined(__EMSCRIPTEN__)
++	// Browser OpenAL (Web Audio) cannot enumerate devices.
++	static const ALCchar webAudioName[] = "Web Audio\0";
++	if (!devices)
++		devices = webAudioName;
++#endif
+ 	m_SoundCardNames.clear();
+ 	if (devices)
+ 	{
+
+--- a/source/third_party/glad/include/glad/gles2.h	2025-04-28 20:20:25.000000000 +0000
++++ b/source/third_party/glad/include/glad/gles2.h	2026-10-16 13:45:38.190149648 +0000
 @@ -1,5 +1,5 @@
  /**
-- * Loader generated by glad 2.0.2 on 11/21/22 00:23:14
+- * Loader generated by glad 2.0.7 on Sat Sep  7 20:28:16 2024
 + * Loader generated by glad 2.0.8 on Fri Oct 16 11:08:35 2026
   *
   * SPDX-License-Identifier: (WTFPL OR CC0-1.0) AND Apache-2.0
   *
-@@ -8,21 +8,21 @@
+@@ -8,7 +8,7 @@
   * Extensions: 9
   *
   * APIs:
@@ -53,15 +1600,9 @@ index 536ab7f2..34708aa5 100644
 + *  - gles2=3.0
   *
   * Options:
-- *  - ON_DEMAND = False
-- *  - LOADER = False
   *  - ALIAS = False
-- *  - HEADER_ONLY = False
-  *  - DEBUG = False
-+ *  - HEADER_ONLY = False
-+ *  - LOADER = False
-  *  - MX = False
-+ *  - ON_DEMAND = False
+@@ -19,10 +19,10 @@
+  *  - ON_DEMAND = False
   *
   * Commandline:
 - *    --api='gles2=2.0' --extensions='GL_EXT_discard_framebuffer,GL_EXT_texture_compression_s3tc,GL_EXT_texture_filter_anisotropic,GL_EXT_texture_format_BGRA8888,GL_KHR_debug,GL_OES_depth32,GL_OES_mapbuffer,GL_OES_rgb8_rgba8,GL_OES_texture_border_clamp' c
@@ -73,16 +1614,16 @@ index 536ab7f2..34708aa5 100644
   *
   */
  
-@@ -163,7 +163,7 @@ extern "C" {
+@@ -163,7 +163,7 @@
  #define GLAD_VERSION_MAJOR(version) (version / 10000)
  #define GLAD_VERSION_MINOR(version) (version % 10000)
  
--#define GLAD_GENERATOR_VERSION "2.0.2"
+-#define GLAD_GENERATOR_VERSION "2.0.7"
 +#define GLAD_GENERATOR_VERSION "2.0.8"
  
  typedef void (*GLADapiproc)(void);
  
-@@ -179,12 +179,17 @@ typedef void (*GLADpostcallback)(void *ret, const char *name, GLADapiproc apipro
+@@ -179,12 +179,17 @@
  #define GL_ACTIVE_ATTRIBUTE_MAX_LENGTH 0x8B8A
  #define GL_ACTIVE_TEXTURE 0x84E0
  #define GL_ACTIVE_UNIFORMS 0x8B86
@@ -100,7 +1641,7 @@ index 536ab7f2..34708aa5 100644
  #define GL_ARRAY_BUFFER 0x8892
  #define GL_ARRAY_BUFFER_BINDING 0x8894
  #define GL_ATTACHED_SHADERS 0x8B85
-@@ -199,14 +204,20 @@ typedef void (*GLADpostcallback)(void *ret, const char *name, GLADapiproc apipro
+@@ -199,14 +204,20 @@
  #define GL_BLEND_EQUATION_RGB 0x8009
  #define GL_BLEND_SRC_ALPHA 0x80CB
  #define GL_BLEND_SRC_RGB 0x80C9
@@ -121,7 +1662,7 @@ index 536ab7f2..34708aa5 100644
  #define GL_BUFFER_MAP_POINTER_OES 0x88BD
  #define GL_BUFFER_SIZE 0x8764
  #define GL_BUFFER_USAGE 0x8765
-@@ -214,23 +225,73 @@ typedef void (*GLADpostcallback)(void *ret, const char *name, GLADapiproc apipro
+@@ -214,23 +225,73 @@
  #define GL_CCW 0x0901
  #define GL_CLAMP_TO_BORDER_OES 0x812D
  #define GL_CLAMP_TO_EDGE 0x812F
@@ -195,7 +1736,7 @@ index 536ab7f2..34708aa5 100644
  #define GL_CURRENT_VERTEX_ATTRIB 0x8626
  #define GL_CW 0x0900
  #define GL_DEBUG_CALLBACK_FUNCTION_KHR 0x8244
-@@ -262,23 +323,50 @@ typedef void (*GLADpostcallback)(void *ret, const char *name, GLADapiproc apipro
+@@ -262,23 +323,50 @@
  #define GL_DECR 0x1E03
  #define GL_DECR_WRAP 0x8508
  #define GL_DELETE_STATUS 0x8B80
@@ -246,7 +1787,7 @@ index 536ab7f2..34708aa5 100644
  #define GL_ELEMENT_ARRAY_BUFFER 0x8893
  #define GL_ELEMENT_ARRAY_BUFFER_BINDING 0x8895
  #define GL_EQUAL 0x0202
-@@ -287,23 +375,43 @@ typedef void (*GLADpostcallback)(void *ret, const char *name, GLADapiproc apipro
+@@ -287,23 +375,43 @@
  #define GL_FASTEST 0x1101
  #define GL_FIXED 0x140C
  #define GL_FLOAT 0x1406
@@ -290,7 +1831,7 @@ index 536ab7f2..34708aa5 100644
  #define GL_FRAMEBUFFER_UNSUPPORTED 0x8CDD
  #define GL_FRONT 0x0404
  #define GL_FRONT_AND_BACK 0x0408
-@@ -314,7 +422,9 @@ typedef void (*GLADpostcallback)(void *ret, const char *name, GLADapiproc apipro
+@@ -314,7 +422,9 @@
  #define GL_GENERATE_MIPMAP_HINT 0x8192
  #define GL_GEQUAL 0x0206
  #define GL_GREATER 0x0204
@@ -300,7 +1841,7 @@ index 536ab7f2..34708aa5 100644
  #define GL_HIGH_FLOAT 0x8DF2
  #define GL_HIGH_INT 0x8DF5
  #define GL_IMPLEMENTATION_COLOR_READ_FORMAT 0x8B9B
-@@ -323,11 +433,18 @@ typedef void (*GLADpostcallback)(void *ret, const char *name, GLADapiproc apipro
+@@ -323,11 +433,18 @@
  #define GL_INCR_WRAP 0x8507
  #define GL_INFO_LOG_LENGTH 0x8B84
  #define GL_INT 0x1404
@@ -319,7 +1860,7 @@ index 536ab7f2..34708aa5 100644
  #define GL_INVALID_OPERATION 0x0502
  #define GL_INVALID_VALUE 0x0501
  #define GL_INVERT 0x150A
-@@ -346,25 +463,63 @@ typedef void (*GLADpostcallback)(void *ret, const char *name, GLADapiproc apipro
+@@ -346,25 +463,63 @@
  #define GL_LOW_INT 0x8DF3
  #define GL_LUMINANCE 0x1909
  #define GL_LUMINANCE_ALPHA 0x190A
@@ -383,7 +1924,7 @@ index 536ab7f2..34708aa5 100644
  #define GL_MIRRORED_REPEAT 0x8370
  #define GL_NEAREST 0x2600
  #define GL_NEAREST_MIPMAP_LINEAR 0x2702
-@@ -375,7 +530,11 @@ typedef void (*GLADpostcallback)(void *ret, const char *name, GLADapiproc apipro
+@@ -375,7 +530,11 @@
  #define GL_NOTEQUAL 0x0205
  #define GL_NO_ERROR 0
  #define GL_NUM_COMPRESSED_TEXTURE_FORMATS 0x86A2
@@ -395,7 +1936,7 @@ index 536ab7f2..34708aa5 100644
  #define GL_ONE 1
  #define GL_ONE_MINUS_CONSTANT_ALPHA 0x8004
  #define GL_ONE_MINUS_CONSTANT_COLOR 0x8002
-@@ -385,14 +544,44 @@ typedef void (*GLADpostcallback)(void *ret, const char *name, GLADapiproc apipro
+@@ -385,14 +544,44 @@
  #define GL_ONE_MINUS_SRC_COLOR 0x0301
  #define GL_OUT_OF_MEMORY 0x0505
  #define GL_PACK_ALIGNMENT 0x0D05
@@ -440,7 +1981,7 @@ index 536ab7f2..34708aa5 100644
  #define GL_RENDERBUFFER 0x8D41
  #define GL_RENDERBUFFER_ALPHA_SIZE 0x8D53
  #define GL_RENDERBUFFER_BINDING 0x8CA7
-@@ -402,20 +591,64 @@ typedef void (*GLADpostcallback)(void *ret, const char *name, GLADapiproc apipro
+@@ -402,20 +591,64 @@
  #define GL_RENDERBUFFER_HEIGHT 0x8D43
  #define GL_RENDERBUFFER_INTERNAL_FORMAT 0x8D44
  #define GL_RENDERBUFFER_RED_SIZE 0x8D50
@@ -505,7 +2046,7 @@ index 536ab7f2..34708aa5 100644
  #define GL_SAMPLER_KHR 0x82E6
  #define GL_SAMPLES 0x80A9
  #define GL_SAMPLE_ALPHA_TO_COVERAGE 0x809E
-@@ -425,6 +658,7 @@ typedef void (*GLADpostcallback)(void *ret, const char *name, GLADapiproc apipro
+@@ -425,6 +658,7 @@
  #define GL_SAMPLE_COVERAGE_VALUE 0x80AA
  #define GL_SCISSOR_BOX 0x0C10
  #define GL_SCISSOR_TEST 0x0C11
@@ -513,7 +2054,7 @@ index 536ab7f2..34708aa5 100644
  #define GL_SHADER_BINARY_FORMATS 0x8DF8
  #define GL_SHADER_COMPILER 0x8DFA
  #define GL_SHADER_KHR 0x82E1
-@@ -432,12 +666,20 @@ typedef void (*GLADpostcallback)(void *ret, const char *name, GLADapiproc apipro
+@@ -432,12 +666,20 @@
  #define GL_SHADER_TYPE 0x8B4F
  #define GL_SHADING_LANGUAGE_VERSION 0x8B8C
  #define GL_SHORT 0x1402
@@ -534,7 +2075,7 @@ index 536ab7f2..34708aa5 100644
  #define GL_STENCIL_ATTACHMENT 0x8D20
  #define GL_STENCIL_BACK_FAIL 0x8801
  #define GL_STENCIL_BACK_FUNC 0x8800
-@@ -459,8 +701,16 @@ typedef void (*GLADpostcallback)(void *ret, const char *name, GLADapiproc apipro
+@@ -459,8 +701,16 @@
  #define GL_STENCIL_TEST 0x0B90
  #define GL_STENCIL_VALUE_MASK 0x0B93
  #define GL_STENCIL_WRITEMASK 0x0B98
@@ -551,7 +2092,7 @@ index 536ab7f2..34708aa5 100644
  #define GL_TEXTURE 0x1702
  #define GL_TEXTURE0 0x84C0
  #define GL_TEXTURE1 0x84C1
-@@ -495,9 +745,16 @@ typedef void (*GLADpostcallback)(void *ret, const char *name, GLADapiproc apipro
+@@ -495,9 +745,16 @@
  #define GL_TEXTURE8 0x84C8
  #define GL_TEXTURE9 0x84C9
  #define GL_TEXTURE_2D 0x0DE1
@@ -568,7 +2109,7 @@ index 536ab7f2..34708aa5 100644
  #define GL_TEXTURE_CUBE_MAP 0x8513
  #define GL_TEXTURE_CUBE_MAP_NEGATIVE_X 0x8516
  #define GL_TEXTURE_CUBE_MAP_NEGATIVE_Y 0x8518
-@@ -505,19 +762,83 @@ typedef void (*GLADpostcallback)(void *ret, const char *name, GLADapiproc apipro
+@@ -505,19 +762,83 @@
  #define GL_TEXTURE_CUBE_MAP_POSITIVE_X 0x8515
  #define GL_TEXTURE_CUBE_MAP_POSITIVE_Y 0x8517
  #define GL_TEXTURE_CUBE_MAP_POSITIVE_Z 0x8519
@@ -652,7 +2193,7 @@ index 536ab7f2..34708aa5 100644
  #define GL_UNSIGNED_SHORT 0x1403
  #define GL_UNSIGNED_SHORT_4_4_4_4 0x8033
  #define GL_UNSIGNED_SHORT_5_5_5_1 0x8034
-@@ -525,9 +846,12 @@ typedef void (*GLADpostcallback)(void *ret, const char *name, GLADapiproc apipro
+@@ -525,9 +846,12 @@
  #define GL_VALIDATE_STATUS 0x8B83
  #define GL_VENDOR 0x1F00
  #define GL_VERSION 0x1F02
@@ -665,7 +2206,7 @@ index 536ab7f2..34708aa5 100644
  #define GL_VERTEX_ATTRIB_ARRAY_NORMALIZED 0x886A
  #define GL_VERTEX_ATTRIB_ARRAY_POINTER 0x8645
  #define GL_VERTEX_ATTRIB_ARRAY_SIZE 0x8623
-@@ -535,6 +859,7 @@ typedef void (*GLADpostcallback)(void *ret, const char *name, GLADapiproc apipro
+@@ -535,6 +859,7 @@
  #define GL_VERTEX_ATTRIB_ARRAY_TYPE 0x8625
  #define GL_VERTEX_SHADER 0x8B31
  #define GL_VIEWPORT 0x0BA2
@@ -673,7 +2214,7 @@ index 536ab7f2..34708aa5 100644
  #define GL_WRITE_ONLY_OES 0x88B9
  #define GL_ZERO 0
  
-@@ -606,6 +931,8 @@ typedef void (GLAD_API_PTR *GLVULKANPROCNV)(void);
+@@ -606,6 +931,8 @@
  
  #define GL_ES_VERSION_2_0 1
  GLAD_API_CALL int GLAD_GL_ES_VERSION_2_0;
@@ -682,7 +2223,7 @@ index 536ab7f2..34708aa5 100644
  #define GL_EXT_discard_framebuffer 1
  GLAD_API_CALL int GLAD_GL_EXT_discard_framebuffer;
  #define GL_EXT_texture_compression_s3tc 1
-@@ -628,29 +955,46 @@ GLAD_API_CALL int GLAD_GL_OES_texture_border_clamp;
+@@ -628,29 +955,46 @@
  
  typedef void (GLAD_API_PTR *PFNGLACTIVETEXTUREPROC)(GLenum texture);
  typedef void (GLAD_API_PTR *PFNGLATTACHSHADERPROC)(GLuint program, GLuint shader);
@@ -729,7 +2270,7 @@ index 536ab7f2..34708aa5 100644
  typedef GLuint (GLAD_API_PTR *PFNGLCREATEPROGRAMPROC)(void);
  typedef GLuint (GLAD_API_PTR *PFNGLCREATESHADERPROC)(GLenum type);
  typedef void (GLAD_API_PTR *PFNGLCULLFACEPROC)(GLenum mode);
-@@ -660,9 +1004,14 @@ typedef void (GLAD_API_PTR *PFNGLDEBUGMESSAGEINSERTKHRPROC)(GLenum source, GLenu
+@@ -660,9 +1004,14 @@
  typedef void (GLAD_API_PTR *PFNGLDELETEBUFFERSPROC)(GLsizei n, const GLuint * buffers);
  typedef void (GLAD_API_PTR *PFNGLDELETEFRAMEBUFFERSPROC)(GLsizei n, const GLuint * framebuffers);
  typedef void (GLAD_API_PTR *PFNGLDELETEPROGRAMPROC)(GLuint program);
@@ -744,7 +2285,7 @@ index 536ab7f2..34708aa5 100644
  typedef void (GLAD_API_PTR *PFNGLDEPTHFUNCPROC)(GLenum func);
  typedef void (GLAD_API_PTR *PFNGLDEPTHMASKPROC)(GLboolean flag);
  typedef void (GLAD_API_PTR *PFNGLDEPTHRANGEFPROC)(GLfloat n, GLfloat f);
-@@ -671,77 +1020,131 @@ typedef void (GLAD_API_PTR *PFNGLDISABLEPROC)(GLenum cap);
+@@ -671,77 +1020,131 @@
  typedef void (GLAD_API_PTR *PFNGLDISABLEVERTEXATTRIBARRAYPROC)(GLuint index);
  typedef void (GLAD_API_PTR *PFNGLDISCARDFRAMEBUFFEREXTPROC)(GLenum target, GLsizei numAttachments, const GLenum * attachments);
  typedef void (GLAD_API_PTR *PFNGLDRAWARRAYSPROC)(GLenum mode, GLint first, GLsizei count);
@@ -876,7 +2417,7 @@ index 536ab7f2..34708aa5 100644
  typedef void (GLAD_API_PTR *PFNGLSCISSORPROC)(GLint x, GLint y, GLsizei width, GLsizei height);
  typedef void (GLAD_API_PTR *PFNGLSHADERBINARYPROC)(GLsizei count, const GLuint * shaders, GLenum binaryFormat, const void * binary, GLsizei length);
  typedef void (GLAD_API_PTR *PFNGLSHADERSOURCEPROC)(GLuint shader, GLsizei count, const GLchar *const* string, const GLint * length);
-@@ -752,32 +1155,53 @@ typedef void (GLAD_API_PTR *PFNGLSTENCILMASKSEPARATEPROC)(GLenum face, GLuint ma
+@@ -752,32 +1155,53 @@
  typedef void (GLAD_API_PTR *PFNGLSTENCILOPPROC)(GLenum fail, GLenum zfail, GLenum zpass);
  typedef void (GLAD_API_PTR *PFNGLSTENCILOPSEPARATEPROC)(GLenum face, GLenum sfail, GLenum dpfail, GLenum dppass);
  typedef void (GLAD_API_PTR *PFNGLTEXIMAGE2DPROC)(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const void * pixels);
@@ -930,7 +2471,7 @@ index 536ab7f2..34708aa5 100644
  typedef GLboolean (GLAD_API_PTR *PFNGLUNMAPBUFFEROESPROC)(GLenum target);
  typedef void (GLAD_API_PTR *PFNGLUSEPROGRAMPROC)(GLuint program);
  typedef void (GLAD_API_PTR *PFNGLVALIDATEPROGRAMPROC)(GLuint program);
-@@ -789,23 +1213,44 @@ typedef void (GLAD_API_PTR *PFNGLVERTEXATTRIB3FPROC)(GLuint index, GLfloat x, GL
+@@ -789,23 +1213,44 @@
  typedef void (GLAD_API_PTR *PFNGLVERTEXATTRIB3FVPROC)(GLuint index, const GLfloat * v);
  typedef void (GLAD_API_PTR *PFNGLVERTEXATTRIB4FPROC)(GLuint index, GLfloat x, GLfloat y, GLfloat z, GLfloat w);
  typedef void (GLAD_API_PTR *PFNGLVERTEXATTRIB4FVPROC)(GLuint index, const GLfloat * v);
@@ -975,7 +2516,7 @@ index 536ab7f2..34708aa5 100644
  GLAD_API_CALL PFNGLBLENDCOLORPROC glad_glBlendColor;
  #define glBlendColor glad_glBlendColor
  GLAD_API_CALL PFNGLBLENDEQUATIONPROC glad_glBlendEquation;
-@@ -816,6 +1261,8 @@ GLAD_API_CALL PFNGLBLENDFUNCPROC glad_glBlendFunc;
+@@ -816,6 +1261,8 @@
  #define glBlendFunc glad_glBlendFunc
  GLAD_API_CALL PFNGLBLENDFUNCSEPARATEPROC glad_glBlendFuncSeparate;
  #define glBlendFuncSeparate glad_glBlendFuncSeparate
@@ -984,7 +2525,7 @@ index 536ab7f2..34708aa5 100644
  GLAD_API_CALL PFNGLBUFFERDATAPROC glad_glBufferData;
  #define glBufferData glad_glBufferData
  GLAD_API_CALL PFNGLBUFFERSUBDATAPROC glad_glBufferSubData;
-@@ -824,24 +1271,42 @@ GLAD_API_CALL PFNGLCHECKFRAMEBUFFERSTATUSPROC glad_glCheckFramebufferStatus;
+@@ -824,24 +1271,42 @@
  #define glCheckFramebufferStatus glad_glCheckFramebufferStatus
  GLAD_API_CALL PFNGLCLEARPROC glad_glClear;
  #define glClear glad_glClear
@@ -1027,7 +2568,7 @@ index 536ab7f2..34708aa5 100644
  GLAD_API_CALL PFNGLCREATEPROGRAMPROC glad_glCreateProgram;
  #define glCreateProgram glad_glCreateProgram
  GLAD_API_CALL PFNGLCREATESHADERPROC glad_glCreateShader;
-@@ -860,12 +1325,22 @@ GLAD_API_CALL PFNGLDELETEFRAMEBUFFERSPROC glad_glDeleteFramebuffers;
+@@ -860,12 +1325,22 @@
  #define glDeleteFramebuffers glad_glDeleteFramebuffers
  GLAD_API_CALL PFNGLDELETEPROGRAMPROC glad_glDeleteProgram;
  #define glDeleteProgram glad_glDeleteProgram
@@ -1050,7 +2591,7 @@ index 536ab7f2..34708aa5 100644
  GLAD_API_CALL PFNGLDEPTHFUNCPROC glad_glDepthFunc;
  #define glDepthFunc glad_glDepthFunc
  GLAD_API_CALL PFNGLDEPTHMASKPROC glad_glDepthMask;
-@@ -882,44 +1357,80 @@ GLAD_API_CALL PFNGLDISCARDFRAMEBUFFEREXTPROC glad_glDiscardFramebufferEXT;
+@@ -882,44 +1357,80 @@
  #define glDiscardFramebufferEXT glad_glDiscardFramebufferEXT
  GLAD_API_CALL PFNGLDRAWARRAYSPROC glad_glDrawArrays;
  #define glDrawArrays glad_glDrawArrays
@@ -1131,7 +2672,7 @@ index 536ab7f2..34708aa5 100644
  GLAD_API_CALL PFNGLGETBUFFERPOINTERVOESPROC glad_glGetBufferPointervOES;
  #define glGetBufferPointervOES glad_glGetBufferPointervOES
  GLAD_API_CALL PFNGLGETDEBUGMESSAGELOGKHRPROC glad_glGetDebugMessageLogKHR;
-@@ -928,26 +1439,46 @@ GLAD_API_CALL PFNGLGETERRORPROC glad_glGetError;
+@@ -928,26 +1439,46 @@
  #define glGetError glad_glGetError
  GLAD_API_CALL PFNGLGETFLOATVPROC glad_glGetFloatv;
  #define glGetFloatv glad_glGetFloatv
@@ -1178,7 +2719,7 @@ index 536ab7f2..34708aa5 100644
  GLAD_API_CALL PFNGLGETSHADERINFOLOGPROC glad_glGetShaderInfoLog;
  #define glGetShaderInfoLog glad_glGetShaderInfoLog
  GLAD_API_CALL PFNGLGETSHADERPRECISIONFORMATPROC glad_glGetShaderPrecisionFormat;
-@@ -958,6 +1489,10 @@ GLAD_API_CALL PFNGLGETSHADERIVPROC glad_glGetShaderiv;
+@@ -958,6 +1489,10 @@
  #define glGetShaderiv glad_glGetShaderiv
  GLAD_API_CALL PFNGLGETSTRINGPROC glad_glGetString;
  #define glGetString glad_glGetString
@@ -1189,7 +2730,7 @@ index 536ab7f2..34708aa5 100644
  GLAD_API_CALL PFNGLGETTEXPARAMETERIIVOESPROC glad_glGetTexParameterIivOES;
  #define glGetTexParameterIivOES glad_glGetTexParameterIivOES
  GLAD_API_CALL PFNGLGETTEXPARAMETERIUIVOESPROC glad_glGetTexParameterIuivOES;
-@@ -966,12 +1501,24 @@ GLAD_API_CALL PFNGLGETTEXPARAMETERFVPROC glad_glGetTexParameterfv;
+@@ -966,12 +1501,24 @@
  #define glGetTexParameterfv glad_glGetTexParameterfv
  GLAD_API_CALL PFNGLGETTEXPARAMETERIVPROC glad_glGetTexParameteriv;
  #define glGetTexParameteriv glad_glGetTexParameteriv
@@ -1214,7 +2755,7 @@ index 536ab7f2..34708aa5 100644
  GLAD_API_CALL PFNGLGETVERTEXATTRIBPOINTERVPROC glad_glGetVertexAttribPointerv;
  #define glGetVertexAttribPointerv glad_glGetVertexAttribPointerv
  GLAD_API_CALL PFNGLGETVERTEXATTRIBFVPROC glad_glGetVertexAttribfv;
-@@ -980,6 +1527,10 @@ GLAD_API_CALL PFNGLGETVERTEXATTRIBIVPROC glad_glGetVertexAttribiv;
+@@ -980,6 +1527,10 @@
  #define glGetVertexAttribiv glad_glGetVertexAttribiv
  GLAD_API_CALL PFNGLHINTPROC glad_glHint;
  #define glHint glad_glHint
@@ -1225,7 +2766,7 @@ index 536ab7f2..34708aa5 100644
  GLAD_API_CALL PFNGLISBUFFERPROC glad_glIsBuffer;
  #define glIsBuffer glad_glIsBuffer
  GLAD_API_CALL PFNGLISENABLEDPROC glad_glIsEnabled;
-@@ -988,42 +1539,74 @@ GLAD_API_CALL PFNGLISFRAMEBUFFERPROC glad_glIsFramebuffer;
+@@ -988,42 +1539,74 @@
  #define glIsFramebuffer glad_glIsFramebuffer
  GLAD_API_CALL PFNGLISPROGRAMPROC glad_glIsProgram;
  #define glIsProgram glad_glIsProgram
@@ -1300,7 +2841,7 @@ index 536ab7f2..34708aa5 100644
  GLAD_API_CALL PFNGLSCISSORPROC glad_glScissor;
  #define glScissor glad_glScissor
  GLAD_API_CALL PFNGLSHADERBINARYPROC glad_glShaderBinary;
-@@ -1044,6 +1627,8 @@ GLAD_API_CALL PFNGLSTENCILOPSEPARATEPROC glad_glStencilOpSeparate;
+@@ -1044,6 +1627,8 @@
  #define glStencilOpSeparate glad_glStencilOpSeparate
  GLAD_API_CALL PFNGLTEXIMAGE2DPROC glad_glTexImage2D;
  #define glTexImage2D glad_glTexImage2D
@@ -1309,7 +2850,7 @@ index 536ab7f2..34708aa5 100644
  GLAD_API_CALL PFNGLTEXPARAMETERIIVOESPROC glad_glTexParameterIivOES;
  #define glTexParameterIivOES glad_glTexParameterIivOES
  GLAD_API_CALL PFNGLTEXPARAMETERIUIVOESPROC glad_glTexParameterIuivOES;
-@@ -1056,8 +1641,16 @@ GLAD_API_CALL PFNGLTEXPARAMETERIPROC glad_glTexParameteri;
+@@ -1056,8 +1641,16 @@
  #define glTexParameteri glad_glTexParameteri
  GLAD_API_CALL PFNGLTEXPARAMETERIVPROC glad_glTexParameteriv;
  #define glTexParameteriv glad_glTexParameteriv
@@ -1326,7 +2867,7 @@ index 536ab7f2..34708aa5 100644
  GLAD_API_CALL PFNGLUNIFORM1FPROC glad_glUniform1f;
  #define glUniform1f glad_glUniform1f
  GLAD_API_CALL PFNGLUNIFORM1FVPROC glad_glUniform1fv;
-@@ -1066,6 +1659,10 @@ GLAD_API_CALL PFNGLUNIFORM1IPROC glad_glUniform1i;
+@@ -1066,6 +1659,10 @@
  #define glUniform1i glad_glUniform1i
  GLAD_API_CALL PFNGLUNIFORM1IVPROC glad_glUniform1iv;
  #define glUniform1iv glad_glUniform1iv
@@ -1337,7 +2878,7 @@ index 536ab7f2..34708aa5 100644
  GLAD_API_CALL PFNGLUNIFORM2FPROC glad_glUniform2f;
  #define glUniform2f glad_glUniform2f
  GLAD_API_CALL PFNGLUNIFORM2FVPROC glad_glUniform2fv;
-@@ -1074,6 +1671,10 @@ GLAD_API_CALL PFNGLUNIFORM2IPROC glad_glUniform2i;
+@@ -1074,6 +1671,10 @@
  #define glUniform2i glad_glUniform2i
  GLAD_API_CALL PFNGLUNIFORM2IVPROC glad_glUniform2iv;
  #define glUniform2iv glad_glUniform2iv
@@ -1348,7 +2889,7 @@ index 536ab7f2..34708aa5 100644
  GLAD_API_CALL PFNGLUNIFORM3FPROC glad_glUniform3f;
  #define glUniform3f glad_glUniform3f
  GLAD_API_CALL PFNGLUNIFORM3FVPROC glad_glUniform3fv;
-@@ -1082,6 +1683,10 @@ GLAD_API_CALL PFNGLUNIFORM3IPROC glad_glUniform3i;
+@@ -1082,6 +1683,10 @@
  #define glUniform3i glad_glUniform3i
  GLAD_API_CALL PFNGLUNIFORM3IVPROC glad_glUniform3iv;
  #define glUniform3iv glad_glUniform3iv
@@ -1359,7 +2900,7 @@ index 536ab7f2..34708aa5 100644
  GLAD_API_CALL PFNGLUNIFORM4FPROC glad_glUniform4f;
  #define glUniform4f glad_glUniform4f
  GLAD_API_CALL PFNGLUNIFORM4FVPROC glad_glUniform4fv;
-@@ -1090,12 +1695,32 @@ GLAD_API_CALL PFNGLUNIFORM4IPROC glad_glUniform4i;
+@@ -1090,12 +1695,32 @@
  #define glUniform4i glad_glUniform4i
  GLAD_API_CALL PFNGLUNIFORM4IVPROC glad_glUniform4iv;
  #define glUniform4iv glad_glUniform4iv
@@ -1392,7 +2933,7 @@ index 536ab7f2..34708aa5 100644
  GLAD_API_CALL PFNGLUNMAPBUFFEROESPROC glad_glUnmapBufferOES;
  #define glUnmapBufferOES glad_glUnmapBufferOES
  GLAD_API_CALL PFNGLUSEPROGRAMPROC glad_glUseProgram;
-@@ -1118,10 +1743,24 @@ GLAD_API_CALL PFNGLVERTEXATTRIB4FPROC glad_glVertexAttrib4f;
+@@ -1118,10 +1743,24 @@
  #define glVertexAttrib4f glad_glVertexAttrib4f
  GLAD_API_CALL PFNGLVERTEXATTRIB4FVPROC glad_glVertexAttrib4fv;
  #define glVertexAttrib4fv glad_glVertexAttrib4fv
@@ -1417,11 +2958,10 @@ index 536ab7f2..34708aa5 100644
  
  
  
-diff --git a/libraries/source/glad/src/gles2.cpp b/libraries/source/glad/src/gles2.cpp
-index f9b3ff6f..d9de6c6d 100644
---- a/libraries/source/glad/src/gles2.cpp
-+++ b/libraries/source/glad/src/gles2.cpp
-@@ -24,6 +24,7 @@ extern "C" {
+
+--- a/source/third_party/glad/src/gles2.cpp	2025-04-28 20:20:25.000000000 +0000
++++ b/source/third_party/glad/src/gles2.cpp	2026-10-16 13:45:38.192321477 +0000
+@@ -24,6 +24,7 @@
  
  
  int GLAD_GL_ES_VERSION_2_0 = 0;
@@ -1429,7 +2969,7 @@ index f9b3ff6f..d9de6c6d 100644
  int GLAD_GL_EXT_discard_framebuffer = 0;
  int GLAD_GL_EXT_texture_compression_s3tc = 0;
  int GLAD_GL_EXT_texture_filter_anisotropic = 0;
-@@ -38,29 +39,46 @@ int GLAD_GL_OES_texture_border_clamp = 0;
+@@ -38,29 +39,46 @@
  
  PFNGLACTIVETEXTUREPROC glad_glActiveTexture = NULL;
  PFNGLATTACHSHADERPROC glad_glAttachShader = NULL;
@@ -1476,7 +3016,7 @@ index f9b3ff6f..d9de6c6d 100644
  PFNGLCREATEPROGRAMPROC glad_glCreateProgram = NULL;
  PFNGLCREATESHADERPROC glad_glCreateShader = NULL;
  PFNGLCULLFACEPROC glad_glCullFace = NULL;
-@@ -70,9 +88,14 @@ PFNGLDEBUGMESSAGEINSERTKHRPROC glad_glDebugMessageInsertKHR = NULL;
+@@ -70,9 +88,14 @@
  PFNGLDELETEBUFFERSPROC glad_glDeleteBuffers = NULL;
  PFNGLDELETEFRAMEBUFFERSPROC glad_glDeleteFramebuffers = NULL;
  PFNGLDELETEPROGRAMPROC glad_glDeleteProgram = NULL;
@@ -1491,7 +3031,7 @@ index f9b3ff6f..d9de6c6d 100644
  PFNGLDEPTHFUNCPROC glad_glDepthFunc = NULL;
  PFNGLDEPTHMASKPROC glad_glDepthMask = NULL;
  PFNGLDEPTHRANGEFPROC glad_glDepthRangef = NULL;
-@@ -81,77 +104,131 @@ PFNGLDISABLEPROC glad_glDisable = NULL;
+@@ -81,77 +104,131 @@
  PFNGLDISABLEVERTEXATTRIBARRAYPROC glad_glDisableVertexAttribArray = NULL;
  PFNGLDISCARDFRAMEBUFFEREXTPROC glad_glDiscardFramebufferEXT = NULL;
  PFNGLDRAWARRAYSPROC glad_glDrawArrays = NULL;
@@ -1623,7 +3163,7 @@ index f9b3ff6f..d9de6c6d 100644
  PFNGLSCISSORPROC glad_glScissor = NULL;
  PFNGLSHADERBINARYPROC glad_glShaderBinary = NULL;
  PFNGLSHADERSOURCEPROC glad_glShaderSource = NULL;
-@@ -162,32 +239,53 @@ PFNGLSTENCILMASKSEPARATEPROC glad_glStencilMaskSeparate = NULL;
+@@ -162,32 +239,53 @@
  PFNGLSTENCILOPPROC glad_glStencilOp = NULL;
  PFNGLSTENCILOPSEPARATEPROC glad_glStencilOpSeparate = NULL;
  PFNGLTEXIMAGE2DPROC glad_glTexImage2D = NULL;
@@ -1677,7 +3217,7 @@ index f9b3ff6f..d9de6c6d 100644
  PFNGLUNMAPBUFFEROESPROC glad_glUnmapBufferOES = NULL;
  PFNGLUSEPROGRAMPROC glad_glUseProgram = NULL;
  PFNGLVALIDATEPROGRAMPROC glad_glValidateProgram = NULL;
-@@ -199,8 +297,15 @@ PFNGLVERTEXATTRIB3FPROC glad_glVertexAttrib3f = NULL;
+@@ -199,8 +297,15 @@
  PFNGLVERTEXATTRIB3FVPROC glad_glVertexAttrib3fv = NULL;
  PFNGLVERTEXATTRIB4FPROC glad_glVertexAttrib4f = NULL;
  PFNGLVERTEXATTRIB4FVPROC glad_glVertexAttrib4fv = NULL;
@@ -1693,7 +3233,7 @@ index f9b3ff6f..d9de6c6d 100644
  
  
  static void glad_gl_load_GL_ES_VERSION_2_0( GLADuserptrloadfunc load, void* userptr) {
-@@ -348,6 +453,113 @@ static void glad_gl_load_GL_ES_VERSION_2_0( GLADuserptrloadfunc load, void* user
+@@ -348,6 +453,113 @@
      glad_glVertexAttribPointer = (PFNGLVERTEXATTRIBPOINTERPROC) load(userptr, "glVertexAttribPointer");
      glad_glViewport = (PFNGLVIEWPORTPROC) load(userptr, "glViewport");
  }
@@ -1807,162 +3347,7 @@ index f9b3ff6f..d9de6c6d 100644
  static void glad_gl_load_GL_EXT_discard_framebuffer( GLADuserptrloadfunc load, void* userptr) {
      if(!GLAD_GL_EXT_discard_framebuffer) return;
      glad_glDiscardFramebufferEXT = (PFNGLDISCARDFRAMEBUFFEREXTPROC) load(userptr, "glDiscardFramebufferEXT");
-@@ -386,36 +598,24 @@ static void glad_gl_load_GL_OES_texture_border_clamp( GLADuserptrloadfunc load,
- 
- 
- 
--#if defined(GL_ES_VERSION_3_0) || defined(GL_VERSION_3_0)
--#define GLAD_GL_IS_SOME_NEW_VERSION 1
--#else
--#define GLAD_GL_IS_SOME_NEW_VERSION 0
--#endif
--
--static int glad_gl_get_extensions( int version, const char **out_exts, unsigned int *out_num_exts_i, char ***out_exts_i) {
--#if GLAD_GL_IS_SOME_NEW_VERSION
--    if(GLAD_VERSION_MAJOR(version) < 3) {
--#else
--    GLAD_UNUSED(version);
--    GLAD_UNUSED(out_num_exts_i);
--    GLAD_UNUSED(out_exts_i);
--#endif
--        if (glad_glGetString == NULL) {
--            return 0;
-+static void glad_gl_free_extensions(char **exts_i) {
-+    if (exts_i != NULL) {
-+        unsigned int index;
-+        for(index = 0; exts_i[index]; index++) {
-+            free((void *) (exts_i[index]));
-         }
--        *out_exts = (const char *)glad_glGetString(GL_EXTENSIONS);
--#if GLAD_GL_IS_SOME_NEW_VERSION
--    } else {
-+        free((void *)exts_i);
-+        exts_i = NULL;
-+    }
-+}
-+static int glad_gl_get_extensions( const char **out_exts, char ***out_exts_i) {
-+#if defined(GL_ES_VERSION_3_0) || defined(GL_VERSION_3_0)
-+    if (glad_glGetStringi != NULL && glad_glGetIntegerv != NULL) {
-         unsigned int index = 0;
-         unsigned int num_exts_i = 0;
-         char **exts_i = NULL;
--        if (glad_glGetStringi == NULL || glad_glGetIntegerv == NULL) {
--            return 0;
--        }
-         glad_glGetIntegerv(GL_NUM_EXTENSIONS, (int*) &num_exts_i);
--        if (num_exts_i > 0) {
--            exts_i = (char **) malloc(num_exts_i * (sizeof *exts_i));
--        }
-+        exts_i = (char **) malloc((num_exts_i + 1) * (sizeof *exts_i));
-         if (exts_i == NULL) {
-             return 0;
-         }
-@@ -424,31 +624,40 @@ static int glad_gl_get_extensions( int version, const char **out_exts, unsigned
-             size_t len = strlen(gl_str_tmp) + 1;
- 
-             char *local_str = (char*) malloc(len * sizeof(char));
--            if(local_str != NULL) {
--                memcpy(local_str, gl_str_tmp, len * sizeof(char));
-+            if(local_str == NULL) {
-+                exts_i[index] = NULL;
-+                glad_gl_free_extensions(exts_i);
-+                return 0;
-             }
- 
-+            memcpy(local_str, gl_str_tmp, len * sizeof(char));
-             exts_i[index] = local_str;
-         }
-+        exts_i[index] = NULL;
- 
--        *out_num_exts_i = num_exts_i;
-         *out_exts_i = exts_i;
-+
-+        return 1;
-     }
-+#else
-+    GLAD_UNUSED(out_exts_i);
- #endif
-+    if (glad_glGetString == NULL) {
-+        return 0;
-+    }
-+    *out_exts = (const char *)glad_glGetString(GL_EXTENSIONS);
-     return 1;
- }
--static void glad_gl_free_extensions(char **exts_i, unsigned int num_exts_i) {
--    if (exts_i != NULL) {
-+static int glad_gl_has_extension(const char *exts, char **exts_i, const char *ext) {
-+    if(exts_i) {
-         unsigned int index;
--        for(index = 0; index < num_exts_i; index++) {
--            free((void *) (exts_i[index]));
-+        for(index = 0; exts_i[index]; index++) {
-+            const char *e = exts_i[index];
-+            if(strcmp(e, ext) == 0) {
-+                return 1;
-+            }
-         }
--        free((void *)exts_i);
--        exts_i = NULL;
--    }
--}
--static int glad_gl_has_extension(int version, const char *exts, unsigned int num_exts_i, char **exts_i, const char *ext) {
--    if(GLAD_VERSION_MAJOR(version) < 3 || !GLAD_GL_IS_SOME_NEW_VERSION) {
-+    } else {
-         const char *extensions;
-         const char *loc;
-         const char *terminator;
-@@ -468,14 +677,6 @@ static int glad_gl_has_extension(int version, const char *exts, unsigned int num
-             }
-             extensions = terminator;
-         }
--    } else {
--        unsigned int index;
--        for(index = 0; index < num_exts_i; index++) {
--            const char *e = exts_i[index];
--            if(strcmp(e, ext) == 0) {
--                return 1;
--            }
--        }
-     }
-     return 0;
- }
-@@ -484,23 +685,22 @@ static GLADapiproc glad_gl_get_proc_from_userptr(void *userptr, const char* name
-     return (GLAD_GNUC_EXTENSION (GLADapiproc (*)(const char *name)) userptr)(name);
- }
- 
--static int glad_gl_find_extensions_gles2( int version) {
-+static int glad_gl_find_extensions_gles2(void) {
-     const char *exts = NULL;
--    unsigned int num_exts_i = 0;
-     char **exts_i = NULL;
--    if (!glad_gl_get_extensions(version, &exts, &num_exts_i, &exts_i)) return 0;
-+    if (!glad_gl_get_extensions(&exts, &exts_i)) return 0;
- 
--    GLAD_GL_EXT_discard_framebuffer = glad_gl_has_extension(version, exts, num_exts_i, exts_i, "GL_EXT_discard_framebuffer");
--    GLAD_GL_EXT_texture_compression_s3tc = glad_gl_has_extension(version, exts, num_exts_i, exts_i, "GL_EXT_texture_compression_s3tc");
--    GLAD_GL_EXT_texture_filter_anisotropic = glad_gl_has_extension(version, exts, num_exts_i, exts_i, "GL_EXT_texture_filter_anisotropic");
--    GLAD_GL_EXT_texture_format_BGRA8888 = glad_gl_has_extension(version, exts, num_exts_i, exts_i, "GL_EXT_texture_format_BGRA8888");
--    GLAD_GL_KHR_debug = glad_gl_has_extension(version, exts, num_exts_i, exts_i, "GL_KHR_debug");
--    GLAD_GL_OES_depth32 = glad_gl_has_extension(version, exts, num_exts_i, exts_i, "GL_OES_depth32");
--    GLAD_GL_OES_mapbuffer = glad_gl_has_extension(version, exts, num_exts_i, exts_i, "GL_OES_mapbuffer");
--    GLAD_GL_OES_rgb8_rgba8 = glad_gl_has_extension(version, exts, num_exts_i, exts_i, "GL_OES_rgb8_rgba8");
--    GLAD_GL_OES_texture_border_clamp = glad_gl_has_extension(version, exts, num_exts_i, exts_i, "GL_OES_texture_border_clamp");
-+    GLAD_GL_EXT_discard_framebuffer = glad_gl_has_extension(exts, exts_i, "GL_EXT_discard_framebuffer");
-+    GLAD_GL_EXT_texture_compression_s3tc = glad_gl_has_extension(exts, exts_i, "GL_EXT_texture_compression_s3tc");
-+    GLAD_GL_EXT_texture_filter_anisotropic = glad_gl_has_extension(exts, exts_i, "GL_EXT_texture_filter_anisotropic");
-+    GLAD_GL_EXT_texture_format_BGRA8888 = glad_gl_has_extension(exts, exts_i, "GL_EXT_texture_format_BGRA8888");
-+    GLAD_GL_KHR_debug = glad_gl_has_extension(exts, exts_i, "GL_KHR_debug");
-+    GLAD_GL_OES_depth32 = glad_gl_has_extension(exts, exts_i, "GL_OES_depth32");
-+    GLAD_GL_OES_mapbuffer = glad_gl_has_extension(exts, exts_i, "GL_OES_mapbuffer");
-+    GLAD_GL_OES_rgb8_rgba8 = glad_gl_has_extension(exts, exts_i, "GL_OES_rgb8_rgba8");
-+    GLAD_GL_OES_texture_border_clamp = glad_gl_has_extension(exts, exts_i, "GL_OES_texture_border_clamp");
- 
--    glad_gl_free_extensions(exts_i, num_exts_i);
-+    glad_gl_free_extensions(exts_i);
- 
-     return 1;
- }
-@@ -530,6 +730,7 @@ static int glad_gl_find_core_gles2(void) {
+@@ -518,6 +730,7 @@
      GLAD_IMPL_UTIL_SSCANF(version, "%d.%d", &major, &minor);
  
      GLAD_GL_ES_VERSION_2_0 = (major == 2 && minor >= 0) || major > 2;
@@ -1970,248 +3355,11 @@ index f9b3ff6f..d9de6c6d 100644
  
      return GLAD_MAKE_VERSION(major, minor);
  }
-@@ -539,12 +740,12 @@ int gladLoadGLES2UserPtr( GLADuserptrloadfunc load, void *userptr) {
- 
-     glad_glGetString = (PFNGLGETSTRINGPROC) load(userptr, "glGetString");
-     if(glad_glGetString == NULL) return 0;
--    if(glad_glGetString(GL_VERSION) == NULL) return 0;
+@@ -530,6 +743,7 @@
      version = glad_gl_find_core_gles2();
  
      glad_gl_load_GL_ES_VERSION_2_0(load, userptr);
 +    glad_gl_load_GL_ES_VERSION_3_0(load, userptr);
  
--    if (!glad_gl_find_extensions_gles2(version)) return 0;
-+    if (!glad_gl_find_extensions_gles2()) return 0;
+     if (!glad_gl_find_extensions_gles2()) return 0;
      glad_gl_load_GL_EXT_discard_framebuffer(load, userptr);
-     glad_gl_load_GL_KHR_debug(load, userptr);
-     glad_gl_load_GL_OES_mapbuffer(load, userptr);
-diff --git a/source/graphics/ColladaManager.cpp b/source/graphics/ColladaManager.cpp
-index 7684cbe7..8c12f22c 100644
---- a/source/graphics/ColladaManager.cpp
-+++ b/source/graphics/ColladaManager.cpp
-@@ -55,6 +55,17 @@ namespace
- 	}
- }
- 
-+#if defined(__EMSCRIPTEN__)
-+// The browser build links the converter statically instead of dlopen()ing it.
-+extern "C"
-+{
-+void set_logger(Collada::LogFn logger, void* cb_data);
-+int set_skeleton_definitions(const char* xml, int length);
-+int convert_dae_to_pmd(const char* dae, Collada::OutputFn pmd_writer, void* cb_data);
-+int convert_dae_to_psa(const char* dae, Collada::OutputFn psa_writer, void* cb_data);
-+}
-+#endif
-+
- class CColladaManagerImpl
- {
- 	DllLoader dll;
-@@ -186,6 +197,13 @@ public:
- 
- 	bool TryLoadDLL()
- 	{
-+#if defined(__EMSCRIPTEN__)
-+		this->set_logger = &::set_logger;
-+		this->set_skeleton_definitions = &::set_skeleton_definitions;
-+		this->convert_dae_to_pmd = &::convert_dae_to_pmd;
-+		this->convert_dae_to_psa = &::convert_dae_to_psa;
-+		return true;
-+#endif
- 		if (!dll.LoadDLL())
- 		{
- 			LOGERROR("Failed to load COLLADA conversion DLL");
-diff --git a/source/lib/external_libraries/opengles2_wrapper.h b/source/lib/external_libraries/opengles2_wrapper.h
-index 00b8bca2..ee24043d 100644
---- a/source/lib/external_libraries/opengles2_wrapper.h
-+++ b/source/lib/external_libraries/opengles2_wrapper.h
-@@ -81,9 +81,29 @@
- // GL_OES_rgb8_rgba8
- #define GL_RGBA8 GL_RGBA8_OES
- 
-+#if defined(__EMSCRIPTEN__)
-+// WebGL2 (OpenGL ES 3.0) core equivalents of desktop EXT functionality.
-+#define glBlitFramebufferEXT glBlitFramebuffer
-+#define GL_READ_FRAMEBUFFER_EXT GL_READ_FRAMEBUFFER
-+#define GL_DRAW_FRAMEBUFFER_EXT GL_DRAW_FRAMEBUFFER
-+#endif
-+
-+#if defined(__EMSCRIPTEN__)
-+// WebGL has neither GL_OES_mapbuffer nor glMapBuffer; Emscripten emulates glMapBufferRange
-+// (with -sFULL_ES3), writing the data back with glBufferSubData on unmap.
-+inline void* oad_MapBufferWrite(GLenum target, GLenum /*access*/)
-+{
-+	GLint size = 0;
-+	glGetBufferParameteriv(target, GL_BUFFER_SIZE, &size);
-+	return glMapBufferRange(target, 0, size, GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
-+}
-+#define glMapBufferARB oad_MapBufferWrite
-+#define glUnmapBufferARB glUnmapBuffer
-+#else
- // GL_OES_mapbuffer
- #define glMapBufferARB glMapBufferOES
- #define glUnmapBufferARB glUnmapBufferOES
-+#endif
- 
- // GL_OES_depth32
- #define GL_DEPTH_COMPONENT32 GL_DEPTH_COMPONENT32_OES
-diff --git a/source/lib/tex/tex.cpp b/source/lib/tex/tex.cpp
-index dc0c98ee..e0352235 100644
---- a/source/lib/tex/tex.cpp
-+++ b/source/lib/tex/tex.cpp
-@@ -660,7 +660,12 @@ u32 Tex::get_average_color() const
- 	WARN_IF_ERR(basetex.transform_to(TEX_BGR | TEX_ALPHA));
- 
- 	// extract components into u32
--	ENSURE(basetex.m_DataSize >= basetex.m_Ofs+4);
-+	if(basetex.m_DataSize < basetex.m_Ofs+4)
-+	{
-+		// e.g. 8-bit greyscale textures that cannot be expanded to BGRA: no meaningful average colour
-+		debug_printf("Tex::get_average_color: unsupported layout (bpp=%zu flags=0x%zx dataSize=%zu)\n", m_Bpp, m_Flags, basetex.m_DataSize);
-+		return 0;
-+	}
- 	u8 b = basetex.m_Data.get()[basetex.m_Ofs];
- 	u8 g = basetex.m_Data.get()[basetex.m_Ofs+1];
- 	u8 r = basetex.m_Data.get()[basetex.m_Ofs+2];
-diff --git a/source/renderer/backend/gl/Device.cpp b/source/renderer/backend/gl/Device.cpp
-index 76417a92..10e676ff 100644
---- a/source/renderer/backend/gl/Device.cpp
-+++ b/source/renderer/backend/gl/Device.cpp
-@@ -1049,7 +1049,7 @@ bool CDevice::IsFramebufferFormatSupported(const Format format) const
- 	{
- 	case Format::UNDEFINED:
- 		break;
--#if !CONFIG2_GLES
-+#if !CONFIG2_GLES || defined(__EMSCRIPTEN__)
- 	case Format::R8_UNORM:
- 		supported = ogl_HaveVersion(3, 0);
- 		break;
-@@ -1068,7 +1068,7 @@ Format CDevice::GetPreferredDepthStencilFormat(
- {
- 	ENSURE(depth || stencil);
- 	if (stencil)
--#if CONFIG2_GLES
-+#if CONFIG2_GLES && !defined(__EMSCRIPTEN__)
- 		return Format::UNDEFINED;
- #else
- 		return Format::D24_UNORM_S8_UINT;
-diff --git a/source/renderer/backend/gl/DeviceCommandContext.cpp b/source/renderer/backend/gl/DeviceCommandContext.cpp
-index f7d79401..f987abaa 100644
---- a/source/renderer/backend/gl/DeviceCommandContext.cpp
-+++ b/source/renderer/backend/gl/DeviceCommandContext.cpp
-@@ -322,9 +322,10 @@ void CDeviceCommandContext::UploadTextureRegion(
- 		ENSURE(layer == 0);
- 		if (texture->GetFormat() == Format::R8G8B8A8_UNORM ||
- 			texture->GetFormat() == Format::R8G8B8_UNORM ||
--#if !CONFIG2_GLES
-+#if !CONFIG2_GLES || defined(__EMSCRIPTEN__)
- 			texture->GetFormat() == Format::R8_UNORM ||
- #endif
-+			texture->GetFormat() == Format::L8_UNORM ||
- 			texture->GetFormat() == Format::A8_UNORM)
- 		{
- 			ENSURE(texture->GetFormat() == dataFormat);
-@@ -338,7 +339,7 @@ void CDeviceCommandContext::UploadTextureRegion(
- 				pixelFormat = GL_RGB;
- 				bytesPerPixel = 3;
- 				break;
--#if !CONFIG2_GLES
-+#if !CONFIG2_GLES || defined(__EMSCRIPTEN__)
- 			case Format::R8_UNORM:
- 				pixelFormat = GL_RED;
- 				bytesPerPixel = 1;
-@@ -841,7 +842,7 @@ void CDeviceCommandContext::BlitFramebuffer(
- 	ENSURE(!m_InsideFramebufferPass);
- 	CFramebuffer* destinationFramebuffer = dstFramebuffer->As<CFramebuffer>();
- 	CFramebuffer* sourceFramebuffer = srcFramebuffer->As<CFramebuffer>();
--#if CONFIG2_GLES
-+#if CONFIG2_GLES && !defined(__EMSCRIPTEN__)
- 	UNUSED2(destinationFramebuffer);
- 	UNUSED2(sourceFramebuffer);
- 	UNUSED2(destinationRegion);
-diff --git a/source/renderer/backend/gl/Framebuffer.cpp b/source/renderer/backend/gl/Framebuffer.cpp
-index 560deb76..c68d2dd8 100644
---- a/source/renderer/backend/gl/Framebuffer.cpp
-+++ b/source/renderer/backend/gl/Framebuffer.cpp
-@@ -102,7 +102,13 @@ std::unique_ptr<CFramebuffer> CFramebuffer::Create(
- 			ENSURE(colorAttachment->texture->GetType() == depthStencilAttachmentTexture->GetType());
- 		}
- 		ENSURE(IsDepthFormat(depthStencilAttachmentTexture->GetFormat()));
--#if CONFIG2_GLES
-+#if CONFIG2_GLES && defined(__EMSCRIPTEN__)
-+		// WebGL2 supports combined depth-stencil attachments.
-+		const GLenum attachment = hasStencil ?
-+			GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT;
-+		ENSURE(depthStencilAttachmentTexture->GetType() == CTexture::Type::TEXTURE_2D);
-+		const GLenum textureTarget = GL_TEXTURE_2D;
-+#elif CONFIG2_GLES
- 		ENSURE(depthStencilAttachmentTexture->GetFormat() == Format::D24_UNORM);
- 		const GLenum attachment = GL_DEPTH_ATTACHMENT;
- 		ENSURE(depthStencilAttachmentTexture->GetType() == CTexture::Type::TEXTURE_2D);
-diff --git a/source/renderer/backend/gl/ShaderProgram.cpp b/source/renderer/backend/gl/ShaderProgram.cpp
-index 42416144..632e9a67 100644
---- a/source/renderer/backend/gl/ShaderProgram.cpp
-+++ b/source/renderer/backend/gl/ShaderProgram.cpp
-@@ -703,6 +703,9 @@ public:
- 			source.Replace("#version 110\r\n", "#version 100\nprecision highp float;\n");
- 			source.Replace("#version 120\n", "#version 100\nprecision highp float;\n");
- 			source.Replace("#version 120\r\n", "#version 100\nprecision highp float;\n");
-+			// GLSL ES 1.00 requires constant loop bounds. The parallax loop is capped at 20 by the
-+			// shader itself (iter = min(20, ...)), so give it a constant bound plus an early exit.
-+			source.Replace("for (int i = 0; i < iter; ++i) {", "for (int i = 0; i < 20; ++i) { if (i >= iter) break;");
- #endif
- 			if (!CompileGLSL(shader, path, source))
- 				return;
-diff --git a/source/renderer/backend/gl/Texture.cpp b/source/renderer/backend/gl/Texture.cpp
-index fc91088f..acdc00ff 100644
---- a/source/renderer/backend/gl/Texture.cpp
-+++ b/source/renderer/backend/gl/Texture.cpp
-@@ -192,9 +192,13 @@ std::unique_ptr<CTexture> CTexture::Create(
- 			pixelFormat = GL_RGB;
- 			pixelType = GL_UNSIGNED_BYTE;
- 			break;
--#if !CONFIG2_GLES
-+#if !CONFIG2_GLES || defined(__EMSCRIPTEN__)
- 		case Format::R8_UNORM:
-+#if defined(__EMSCRIPTEN__)
-+			internalFormat = GL_R8; // WebGL2 needs a sized internal format
-+#else
- 			internalFormat = GL_RED;
-+#endif
- 			pixelFormat = GL_RED;
- 			pixelType = GL_UNSIGNED_BYTE;
- 			break;
-@@ -209,7 +213,29 @@ std::unique_ptr<CTexture> CTexture::Create(
- 			pixelFormat = GL_LUMINANCE;
- 			pixelType = GL_UNSIGNED_BYTE;
- 			break;
--#if CONFIG2_GLES
-+#if CONFIG2_GLES && defined(__EMSCRIPTEN__)
-+		// WebGL2 (OpenGL ES 3.0) requires sized depth formats with a matching pixel type.
-+		case Format::D16_UNORM:
-+			internalFormat = GL_DEPTH_COMPONENT16;
-+			pixelFormat = GL_DEPTH_COMPONENT;
-+			pixelType = GL_UNSIGNED_SHORT;
-+			break;
-+		case Format::D24_UNORM:
-+			internalFormat = GL_DEPTH_COMPONENT24;
-+			pixelFormat = GL_DEPTH_COMPONENT;
-+			pixelType = GL_UNSIGNED_INT;
-+			break;
-+		case Format::D32_SFLOAT:
-+			internalFormat = GL_DEPTH_COMPONENT32F;
-+			pixelFormat = GL_DEPTH_COMPONENT;
-+			pixelType = GL_FLOAT;
-+			break;
-+		case Format::D24_UNORM_S8_UINT:
-+			internalFormat = GL_DEPTH24_STENCIL8;
-+			pixelFormat = GL_DEPTH_STENCIL;
-+			pixelType = GL_UNSIGNED_INT_24_8;
-+			break;
-+#elif CONFIG2_GLES
- 		// GLES requires pixel type == UNSIGNED_SHORT or UNSIGNED_INT for depth.
- 		case Format::D16_UNORM: FALLTHROUGH;
- 		case Format::D24_UNORM: FALLTHROUGH;
--- 
-2.43.0
-

@@ -33,7 +33,6 @@ struct JSClassOps {
 	void* mayResolve = nullptr;
 	JSFinalizeOp finalize = nullptr;
 	JSNative call = nullptr;
-	void* hasInstance = nullptr;
 	JSNative construct = nullptr;
 	JSTraceOp trace = nullptr;
 };
@@ -274,6 +273,10 @@ bool JS_InstanceOf(JSContext* cx, JS::HandleObject obj, const JSClass* clasp, JS
 JSObject* JS_InitClass(JSContext* cx, JS::HandleObject obj, JS::HandleObject parent_proto, const JSClass* clasp,
 	JSNative constructor, unsigned nargs, const JSPropertySpec* ps, const JSFunctionSpec* fs,
 	const JSPropertySpec* static_ps, const JSFunctionSpec* static_fs);
+inline JSObject* JS_InitClass(JSContext* cx, JS::HandleObject obj, const JSClass* clasp, JS::HandleObject parent_proto, const char*,
+	JSNative constructor, unsigned nargs, const JSPropertySpec* ps, const JSFunctionSpec* fs,
+	const JSPropertySpec* static_ps, const JSFunctionSpec* static_fs)
+{ return JS_InitClass(cx, obj, parent_proto, clasp, constructor, nargs, ps, fs, static_ps, static_fs); }
 JSObject* JS_GetClassObject(JSContext* cx, JSProtoKey key, JS::MutableHandleObject objp);
 
 // ---- Script compilation / evaluation ----
@@ -373,6 +376,7 @@ template<typename T> inline void TraceEdge(JSTracer*, T*, const char*) {}
 namespace js {
 struct SystemAllocPolicy {};
 template<typename T> struct MovableCellHasher {};
+template<typename T> struct StableCellHasher {};
 namespace Scalar {
 enum Type { Int8 = 0, Uint8, Int16, Uint16, Int32, Uint32, Float32, Float64, Uint8Clamped, BigInt64, BigUint64, MaxTypedArrayViewType };
 }
@@ -397,6 +401,7 @@ inline const JS::Latin1Char* JS_GetLatin1StringCharsAndLength(JSContext*, const 
 const char16_t* JS_GetTwoByteStringCharsAndLength(JSContext* cx, const JS::AutoCheckCannotGC&, JSString* str, size_t* length);
 JSString* JS_NewStringCopyUTF8Z(JSContext* cx, const JS::ConstUTF8CharsZ& s);
 inline JSString* JS_AtomizeAndPinJSString(JSContext*, JSString* s) { return s; }
+JSString* JS_AtomizeAndPinString(JSContext* cx, const char* s);
 JSString* JS_AtomizeAndPinUCStringN(JSContext* cx, const char16_t* chars, size_t length);
 
 // Typed arrays / ArrayBuffers.
@@ -474,6 +479,10 @@ void SetProxyReservedSlot(JSObject* obj, size_t slot, const JS::Value& v);
 }
 namespace JS {
 inline Value PrivateValue(void* p) { Value v; v.setPrivate(p); return v; }
+// Reserved slot 0 of class objects is the private pointer in this port.
+template<typename T> inline T* GetMaybePtrFromReservedSlot(JSObject* obj, uint32_t) { return static_cast<T*>(JS_GetPrivate(obj)); }
+inline void SetReservedSlot(JSObject* obj, uint32_t, const Value& v) { JS_SetPrivate(obj, v.toPrivate()); }
+inline bool IsCallable(JSObject* obj) { return JS_ObjectIsFunction(obj); }
 }
 
 // ======== Collections, iteration, promises ========
@@ -515,3 +524,5 @@ inline bool JS_DoubleIsInt32(double d, int32_t* out) { int32_t i = (int32_t)d; i
 
 // SpiderMonkey-only globals (uneval, toSource) that the game scripts use.
 void JSShim_InstallPrelude(JSContext* cx);
+
+using jsid = JS::PropertyKey;

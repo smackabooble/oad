@@ -14,7 +14,7 @@ typedef int CURLMcode;
 typedef int CURLoption;
 typedef int CURLINFO;
 enum { CURLE_OK = 0, CURLE_COULDNT_CONNECT = 7, CURLE_UNSUPPORTED_PROTOCOL = 1 };
-enum { CURLM_OK = 0, CURLM_BAD_HANDLE = 1 };
+enum { CURLM_OK = 0, CURLM_BAD_HANDLE = 1, CURLM_BAD_EASY_HANDLE = 2 };
 enum { CURLMSG_DONE = 1 };
 enum { CURL_ERROR_SIZE = 256 };
 #define CURL_READFUNC_ABORT 0x10000000
@@ -48,6 +48,9 @@ void curl_free(void*);
 struct curl_slist* curl_slist_append(struct curl_slist*, const char*);
 void curl_slist_free_all(struct curl_slist*);
 const char* curl_version(void);
+#define CURLVERSION_NOW 4
+typedef struct { int age; const char* version; unsigned int version_num; } curl_version_info_data;
+const curl_version_info_data* curl_version_info(int);
 CURLM* curl_multi_init(void);
 CURLMcode curl_multi_cleanup(CURLM*);
 CURLMcode curl_multi_add_handle(CURLM*, CURL*);
