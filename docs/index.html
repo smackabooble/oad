@@ -20,7 +20,7 @@ canvas{display:block;width:100vw;height:100vh;outline:none;background:#000}
 #pbar i{display:block;height:100%;width:0;background:#c9a24a}
 #ptxt{font-size:13px;color:#a8a08a;min-height:20px}
 
-#intro{position:fixed;inset:0;z-index:30;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;cursor:pointer;
+#intro{position:fixed;inset:0;z-index:30;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;cursor:default;
   background:radial-gradient(ellipse at 50% 45%,#3a0d0d 0%,#1a0707 45%,#050303 100%);color:#e2c27a;opacity:1;transition:opacity 1s ease}
 #intro.out{opacity:0;pointer-events:none}
 #intro .band{position:absolute;left:0;right:0;height:34px;opacity:.55;
@@ -42,7 +42,7 @@ canvas{display:block;width:100vw;height:100vh;outline:none;background:#000}
 </head>
 <body>
 <div id="intro"><div class="band top"></div><div class="band bot"></div>
-<div class="small">PORTED BY</div><div class="name">KALAKARITZU</div><div class="rule"></div><div class="skip">CLICK TO SKIP</div></div>
+<div class="small">PORTED BY</div><div class="name">KALAKARITZU</div><div class="rule"></div></div>
 <script>
 (function(){
   const el=document.getElementById('intro'); let done=false;
@@ -50,7 +50,6 @@ canvas{display:block;width:100vw;height:100vh;outline:none;background:#000}
   // The very first visit reloads once (service worker enables cross-origin isolation): show the intro after that reload.
   if(!window.crossOriginIsolated && 'serviceWorker' in navigator){ el.remove(); return; }
   setTimeout(end,5200);
-  ['pointerdown','keydown'].forEach(ev=>el.addEventListener(ev,end)); addEventListener('keydown',end,{once:true});
 })();
 </script>
 <canvas id="canvas" tabindex="-1"></canvas>
