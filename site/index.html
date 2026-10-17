@@ -19,8 +19,40 @@ canvas{display:block;width:100vw;height:100vh;outline:none;background:#000}
 #pbar{width:100%;height:10px;background:#2a2518;border-radius:5px;overflow:hidden;display:none}
 #pbar i{display:block;height:100%;width:0;background:#c9a24a}
 #ptxt{font-size:13px;color:#a8a08a;min-height:20px}
-</style></head>
+
+#intro{position:fixed;inset:0;z-index:30;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;cursor:pointer;
+  background:radial-gradient(ellipse at 50% 45%,#3a0d0d 0%,#1a0707 45%,#050303 100%);color:#e2c27a;opacity:1;transition:opacity 1s ease}
+#intro.out{opacity:0;pointer-events:none}
+#intro .band{position:absolute;left:0;right:0;height:34px;opacity:.55;
+  background:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='68' height='34' viewBox='0 0 68 34'><path d='M4 30V4h28v20H16V12h8' fill='none' stroke='%23c9a24a' stroke-width='3' stroke-linecap='square'/><path d='M38 30V4h28v20H50V12h8' fill='none' stroke='%23c9a24a' stroke-width='3' stroke-linecap='square'/></svg>") repeat-x center}
+#intro .band.top{top:26px}#intro .band.bot{bottom:26px;transform:scaleY(-1)}
+#intro .small{font:500 clamp(13px,2.4vw,20px)/1 Cinzel,"Trajan Pro",Georgia,serif;letter-spacing:.55em;text-indent:.55em;color:#b89a5c;opacity:0;animation:fadeUp 1.2s .5s forwards}
+#intro .name{font:700 clamp(34px,9vw,104px)/1.05 Cinzel,"Trajan Pro",Georgia,serif;letter-spacing:.14em;text-indent:.14em;opacity:0;
+  background:linear-gradient(100deg,#8a6a2a 0%,#f3dc9a 40%,#c9a24a 55%,#fff1bd 62%,#9b7a33 100%);background-size:250% 100%;
+  -webkit-background-clip:text;background-clip:text;color:transparent;text-shadow:0 0 40px #c9a24a33;
+  animation:fadeUp 1.4s 1.1s forwards,shine 3.2s 1.4s ease-in-out forwards}
+#intro .rule{height:2px;width:0;background:linear-gradient(90deg,transparent,#c9a24a,transparent);animation:grow 1.6s 1.6s forwards}
+#intro .skip{position:absolute;bottom:80px;font:12px system-ui;color:#7a6a45;letter-spacing:.2em;opacity:0;animation:fadeUp 1s 2.4s forwards}
+@keyframes fadeUp{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}
+@keyframes grow{to{width:min(60vw,520px)}}
+@keyframes shine{from{background-position:100% 0}to{background-position:0 0}}
+@media (prefers-reduced-motion:reduce){#intro *{animation-duration:.01s!important;animation-delay:0s!important}}
+</style>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cinzel:wght@500;700&display=swap">
+</head>
 <body>
+<div id="intro"><div class="band top"></div><div class="band bot"></div>
+<div class="small">PORTED BY</div><div class="name">KALAKARITZU</div><div class="rule"></div><div class="skip">CLICK TO SKIP</div></div>
+<script>
+(function(){
+  const el=document.getElementById('intro'); let done=false;
+  function end(){ if(done) return; done=true; el.classList.add('out'); setTimeout(()=>el.remove(),1100); }
+  // The very first visit reloads once (service worker enables cross-origin isolation): show the intro after that reload.
+  if(!window.crossOriginIsolated && 'serviceWorker' in navigator){ el.remove(); return; }
+  setTimeout(end,5200);
+  ['pointerdown','keydown'].forEach(ev=>el.addEventListener(ev,end)); addEventListener('keydown',end,{once:true});
+})();
+</script>
 <canvas id="canvas" tabindex="-1"></canvas>
 <div id="splash"><h1>0 A.D.</h1><div class="bar" id="spin"><i></i></div>
 <p id="status">Loading&hellip;</p>
