@@ -145,6 +145,7 @@ public:
 
 // Owning variants hold a real refcount so they can outlive the request.
 JSRuntime* JSShim_GlobalRt();
+void JSShim_DeferFree(JSRuntime* rt, JSValue v);
 
 template<typename T>
 class Heap : public Ops<T, Heap<T>, false> {
@@ -152,7 +153,10 @@ class Heap : public Ops<T, Heap<T>, false> {
 	JSRuntime* rt = nullptr;
 	static JSValue J(const T& x) { return Conv<T>::to(x); }
 	void acquire() { rt = JSShim_GlobalRt(); if (rt) JS_DupValueRT(rt, J(v)); }
-	void release() { if (rt) { JS_FreeValueRT(rt, J(v)); rt = nullptr; } }
+	// Dropped references are freed when the outermost script request ends, not immediately: game code often
+	// copies a value out of a Heap/queue into a Rooted and then removes the queue entry (SpiderMonkey's GC kept
+	// the Rooted copy alive; here nothing else would).
+	void release() { if (rt) { JSShim_DeferFree(rt, J(v)); rt = nullptr; } }
 public:
 	Heap() {}
 	explicit Heap(const T& x) : v(x) { acquire(); }
@@ -176,7 +180,8 @@ public:
 
 // Writes through `&persistent` land in scratch storage; they are turned into real references
 // (a) the next time the object is read and (b) before the temp pool is released.
-struct PersistentSyncBase { virtual void sync() = 0; bool registered_ = false; virtual ~PersistentSyncBase() {} };
+struct PersistentSyncBase { virtual void sync() = 0; virtual void retire() = 0; bool registered_ = false; unsigned gen_ = 0; virtual ~PersistentSyncBase() {} };
+unsigned JSShim_DirtyGen();
 void JSShim_RegisterDirty(PersistentSyncBase*);
 void JSShim_UnregisterDirty(PersistentSyncBase*);
 
@@ -200,9 +205,13 @@ public:
 	PersistentRooted& operator=(const PersistentRooted& o) { dirty = false; h = o.get(); return *this; }
 	template<typename U, typename = std::enable_if_t<std::is_convertible_v<const U&, T>>>
 	void set(const U& x) { dirty = false; h = static_cast<const T&>(x); }
-	void sync() override { if (dirty) { h = tmp; dirty = false; } }
+	// sync() copies scratch -> real reference but keeps `dirty`, so a write through an earlier `&persistent` handle that
+	// happens after a (premature) sync is not lost; retire() ends the scratch phase (see JSShim_PoolRelease).
+	void sync() override { if (dirty && !(tmp == h.get())) h = tmp; }
+	void retire() override { dirty = false; }
 	MutableHandle<T> operator&() {
 		if (!dirty) { tmp = h.get(); dirty = true; }
+		gen_ = JSShim_DirtyGen();
 		if (!registered_) JSShim_RegisterDirty(this);
 		return MutableHandle<T>(&tmp);
 	}

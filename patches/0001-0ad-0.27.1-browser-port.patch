@@ -418,7 +418,7 @@
  	if (geteuid() == 0)
 
 --- a/source/network/NetMessageSim.cpp	2025-04-28 20:20:24.000000000 +0000
-+++ b/source/network/NetMessageSim.cpp	2026-10-16 13:45:26.428990274 +0000
++++ b/source/network/NetMessageSim.cpp	2026-10-17 13:05:03.866566175 +0000
 @@ -146,7 +146,7 @@
  	serializer.NumberI32_Unbounded("player", m_Player);
  	serializer.NumberU32_Unbounded("turn", m_Turn);
@@ -1523,9 +1523,30 @@
  		return false;
 
 --- a/source/scriptinterface/StructuredClone.cpp	2025-04-28 20:20:25.000000000 +0000
-+++ b/source/scriptinterface/StructuredClone.cpp	2026-10-16 13:45:26.429871173 +0000
-@@ -42,23 +42,33 @@
++++ b/source/scriptinterface/StructuredClone.cpp	2026-10-17 12:00:46.473763380 +0000
+@@ -40,25 +40,75 @@
+ # pragma warning(pop)
+ #endif
  
++namespace
++{
++// Calls the prelude helper `name` (see shim: __oadTag/__oadUntag) on `v`; returns a new reference or an exception.
++JSValue CallHelper(JSContext* cx, const char* name, JSValueConst v)
++{
++	JSValue global = JS_GetGlobalObject(cx);
++	JSValue fn = JS_GetPropertyStr(cx, global, name);
++	JS_FreeValue(cx, global);
++	if (!JS_IsFunction(cx, fn))
++	{
++		JS_FreeValue(cx, fn);
++		return JS_ThrowTypeError(cx, "%s is not available", name);
++	}
++	JSValue ret = JS_Call(cx, fn, JS_UNDEFINED, 1, &v);
++	JS_FreeValue(cx, fn);
++	return ret;
++}
++}
++
  Script::StructuredClone Script::WriteStructuredClone(const ScriptRequest& rq, JS::HandleValue v)
  {
 -	Script::StructuredClone ret(new JSStructuredCloneData(JS::StructuredCloneScope::SameProcess));
@@ -1533,7 +1554,21 @@
 -	if (!JS_WriteStructuredClone(rq.cx, v, ret.get(), JS::StructuredCloneScope::SameProcess, policy, nullptr, nullptr, JS::UndefinedHandleValue))
 +	// QuickJS port: serialise with the engine's object writer (keeps shared/cyclic references).
 +	size_t size = 0;
++	bool tagged = false;
 +	uint8_t* data = JS_WriteObject(rq.cx, &size, v.get().raw(), JS_WRITE_OBJ_REFERENCE);
++	if (!data)
++	{
++		// Maps and Sets are not supported by the writer: retry with them rewritten to plain objects.
++		JSValue ex = JS_GetException(rq.cx);
++		JS_FreeValue(rq.cx, ex);
++		JSValue tmp = CallHelper(rq.cx, "__oadTag", v.get().raw());
++		if (!JS_IsException(tmp))
++		{
++			data = JS_WriteObject(rq.cx, &size, tmp, JS_WRITE_OBJ_REFERENCE);
++			tagged = true;
++		}
++		JS_FreeValue(rq.cx, tmp);
++	}
 +	if (!data)
  	{
 -		debug_warn(L"Writing a structured clone with JS_WriteStructuredClone failed!");
@@ -1544,6 +1579,7 @@
  
 +	Script::StructuredClone ret(new JSStructuredCloneData);
 +	ret->buf.assign(data, data + size);
++	ret->tagged = tagged;
 +	js_free(rq.cx, data);
  	return ret;
  }
@@ -1553,6 +1589,12 @@
 -	JS::CloneDataPolicy policy;
 -	if (!JS_ReadStructuredClone(rq.cx, *ptr, JS_STRUCTURED_CLONE_VERSION, ptr->scope(), ret, policy, nullptr, nullptr))
 +	JSValue val = JS_ReadObject(rq.cx, ptr->buf.data(), ptr->buf.size(), JS_READ_OBJ_REFERENCE);
++	if (!JS_IsException(val) && ptr->tagged)
++	{
++		JSValue fixed = CallHelper(rq.cx, "__oadUntag", val);
++		JS_FreeValue(rq.cx, val);
++		val = fixed;
++	}
 +	if (JS_IsException(val))
 +	{
  		ScriptException::CatchPending(rq);

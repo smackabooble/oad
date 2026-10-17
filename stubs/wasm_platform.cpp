@@ -2,6 +2,7 @@
 #include <emscripten.h>
 #include <emscripten/wasmfs.h>
 #include <sys/stat.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <string>
@@ -37,6 +38,17 @@ void WasmMountGameData()
 	MkdirP("/home/web_user");
 	MkdirP("/0ad");
 	setenv("HOME", "/home/web_user", 1);
+	// Default multiplayer name: every browser would otherwise be called "web_user" and clash on join.
+	// Stable per browser (localStorage is only reachable from the main thread).
+	{
+		int id = MAIN_THREAD_EM_ASM_INT({
+			try { let n = localStorage.getItem('oad-pid'); if (!n) { n = String(1000 + Math.floor(Math.random() * 9000)); localStorage.setItem('oad-pid', n); } return parseInt(n, 10); }
+			catch (e) { return 1000 + Math.floor(Math.random() * 9000); }
+		});
+		char name[32];
+		snprintf(name, sizeof(name), "Player%d", id);
+		setenv("LOGNAME", name, 1);
+	}
 	setenv("ICU_DATA", "/0ad/data/icu", 1);
 
 	if (!manifest)

@@ -40,7 +40,7 @@ files.append("main.cpp")
 files.append("lobby/Globals.cpp")
 GLAD = f"{SRC}/third_party/glad" if os.path.isdir(f"{SRC}/third_party/glad") else f"{ROOT}/{SRCDIR}/libraries/source/glad"
 glad = f"{GLAD}/src/gles2.cpp"
-extras = [f"{STUBS}/dir_watch_stub.cpp", f"{STUBS}/curl_stub.cpp", f"{STUBS}/wasm_stubs.cpp", f"{STUBS}/wasm_platform.cpp", f"{SRC}/mocks/mocks_real.cpp"]
+extras = [f"{STUBS}/dir_watch_stub.cpp", f"{STUBS}/curl_stub.cpp", f"{STUBS}/wasm_stubs.cpp", f"{STUBS}/wasm_platform.cpp", f"{STUBS}/webenet.cpp", f"{SRC}/mocks/mocks_real.cpp"]
 
 defs = ["-DNDEBUG", "-DCONFIG_FINAL=1", "-DCONFIG2_NVTT=0", "-DCONFIG2_LOBBY=0",
         "-DCONFIG2_MINIUPNPC=0", "-DCONFIG2_GLES=1"]
@@ -99,8 +99,8 @@ P={DEPS}
 OUT=$1; shift
 cd {OUT}
 em++ -O2 -pthread -fwasm-exceptions {os.environ.get('OAD_XFLAGS', '')} libengine.a $P/lib/libboost_fs.a $P/lib/libqjs.a -L$P/lib -L$P/lib/static \\
-  -lopenal -lenet -lfmt -lxml2 -lSDL2 -lpng16 -lfreetype -lvorbisfile -lvorbis -logg -lz -licui18n -licuuc -licudata -lsodium \\
-  -sUSE_WEBGL2=1 -sFULL_ES3=1 -sALLOW_MEMORY_GROWTH=1 -sSTACK_SIZE=4MB -sINITIAL_MEMORY=512MB -sMAXIMUM_MEMORY=4GB \\
+  -lopenal -lfmt -lxml2 -lSDL2 -lpng16 -lfreetype -lvorbisfile -lvorbis -logg -lz -licui18n -licuuc -licudata -lsodium \\
+  -sUSE_WEBGL2=1 -sFULL_ES3=1 -sALLOW_MEMORY_GROWTH=1 -sSTACK_SIZE=4MB -sINITIAL_MEMORY=512MB -sMAXIMUM_MEMORY=4GB -sEXPORTED_FUNCTIONS=_main,_malloc,_free \\
   -sMAX_WEBGL_VERSION=2 -sEXIT_RUNTIME=0 -sPTHREAD_POOL_SIZE=16 -sPTHREAD_POOL_SIZE_STRICT=0 \\
   -Wl,--error-limit=0 -Wl,--wrap=vswprintf -o $OUT "$@"
 """)

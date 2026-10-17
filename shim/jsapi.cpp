@@ -86,14 +86,24 @@ void JS::JSShim_RegisterDirty(JS::PersistentSyncBase* p) { p->registered_ = true
 void JS::JSShim_UnregisterDirty(JS::PersistentSyncBase* p) {
 	p->registered_ = false; for (size_t i = 0; i < t_dirty.size(); i++) if (t_dirty[i] == p) { t_dirty.erase(t_dirty.begin() + i); break; }
 }
+namespace { thread_local unsigned t_dirtyGen = 0; }
+unsigned JS::JSShim_DirtyGen() { return t_dirtyGen; }
 void JSShim_PoolRelease(JSContext* cx, size_t keep) {
-	for (auto* p : t_dirty) { p->sync(); p->registered_ = false; }
-	t_dirty.clear();
+	// Scratch values written through `&persistent` are made real references here. An entry stays registered for one
+	// more release (grace) because the write may come just after this release ran.
+	std::vector<JS::PersistentSyncBase*> kept;
+	for (auto* p : t_dirty) {
+		p->sync();
+		if (p->gen_ < t_dirtyGen) { p->retire(); p->registered_ = false; } else kept.push_back(p);
+	}
+	t_dirty.swap(kept);
+	t_dirtyGen++;
 	ClearStrKeep();
 	auto& p = t_ctx.pool;
 	while (p.size() > keep) { JS_FreeValue(cx, p.back()); p.pop_back(); }
 }
 JSRuntime* JS::JSShim_GlobalRt() { return t_globalRt; }
+
 void JSShim_SetGlobalCx(JSContext* cx) { t_globalCx = cx; t_globalRt = cx ? JS_GetRuntime(cx) : nullptr; }
 
 // ---- objects ----
@@ -556,8 +566,21 @@ bool JSShim_EvalGlobalName(JSContext* cx, const char* name, JS::MutableHandleVal
 	if (JS_IsException(r)) { JS_FreeValue(cx, JS_GetException(cx)); out.set(JS::UndefinedValue()); return true; }
 	out.set(Pooled(cx, r)); return true;
 }
-void JSShim_RequestEnter() { t_depth++; }
-void JSShim_RequestLeave(JSContext* cx) { if (--t_depth == 0) JSShim_PoolRelease(cx); }
+// The temp pool is released lazily: when the *next* outermost request starts, not when one ends. Functions that
+// open their own request and then return a raw JS::Value (e.g. deserializers) would otherwise hand the caller a
+// value that was just freed.
+thread_local bool t_poolPending = false;
+void JSShim_RequestEnter() {
+	if (t_depth == 0 && t_poolPending) { t_poolPending = false; if (t_globalCx) JSShim_PoolRelease(t_globalCx); }
+	t_depth++;
+}
+// Called when a Heap/PersistentRooted drops its reference: inside a script request the value is parked in the
+// temp pool (and freed when the outermost request ends) so Rooted copies made from it stay valid.
+void JS::JSShim_DeferFree(JSRuntime* rt, JSValue v) {
+	if (rt == t_globalRt && JS_VALUE_HAS_REF_COUNT(v)) { t_ctx.pool.push_back(v); if (t_depth == 0) t_poolPending = true; return; }
+	JS_FreeValueRT(rt, v);
+}
+void JSShim_RequestLeave(JSContext*) { if (--t_depth == 0) t_poolPending = true; }
 bool JS_Init() { return true; }
 void JS_ShutDown() {}
 
@@ -568,7 +591,7 @@ JS::PropertyKey INT_TO_JSID(int i) { return JS::PropertyKey(JS_NewAtomUInt32(t_g
 
 // ======== Batch implementations ========
 JSType JS_TypeOfValue(JSContext* cx, JS::HandleValue v) {
-	if (v.isUndefined()) return JSTYPE_UNDEFINED; if (v.isNull()) return JSTYPE_NULL;
+	if (v.isUndefined()) return JSTYPE_UNDEFINED; if (v.isNull()) return JSTYPE_OBJECT; // as SpiderMonkey: typeof null is an object
 	if (v.isBoolean()) return JSTYPE_BOOLEAN; if (v.isNumber()) return JSTYPE_NUMBER;
 	if (v.isString()) return JSTYPE_STRING; if (v.isSymbol()) return JSTYPE_SYMBOL;
 	if (JS_IsFunction(cx, V(v.get()))) return JSTYPE_FUNCTION;
@@ -837,6 +860,37 @@ void JSShim_InstallPrelude(JSContext* cx) {
 		return r;
 	}
 	g.uneval = function uneval(v) { return u(v, []); };
+	// Structured clone helpers: QuickJS' object writer cannot handle Map/Set, so those are rewritten to tagged
+	// plain objects (keeping shared/cyclic references) before writing and rebuilt after reading.
+	g.__oadTag = function (root) {
+		const memo = new Map();
+		function tag(v) {
+			if (v === null || typeof v !== 'object') return v;
+			if (memo.has(v)) return memo.get(v);
+			let o;
+			if (v instanceof Map) { o = { __oad: 'map', e: [] }; memo.set(v, o); for (const [k, x] of v) o.e.push([tag(k), tag(x)]); return o; }
+			if (v instanceof Set) { o = { __oad: 'set', e: [] }; memo.set(v, o); for (const x of v) o.e.push(tag(x)); return o; }
+			if (v instanceof Date || v instanceof ArrayBuffer || ArrayBuffer.isView(v)) { memo.set(v, v); return v; }
+			if (Array.isArray(v)) { o = new Array(v.length); memo.set(v, o); for (let i = 0; i < v.length; i++) o[i] = tag(v[i]); return o; }
+			o = {}; memo.set(v, o); for (const k of Object.keys(v)) o[k] = tag(v[k]); return o;
+		}
+		return tag(root);
+	};
+	g.__oadUntag = function (root) {
+		const memo = new Map();
+		function untag(v) {
+			if (v === null || typeof v !== 'object') return v;
+			if (memo.has(v)) return memo.get(v);
+			if (v.__oad === 'map') { const m = new Map(); memo.set(v, m); for (const [k, x] of v.e) m.set(untag(k), untag(x)); return m; }
+			if (v.__oad === 'set') { const m = new Set(); memo.set(v, m); for (const x of v.e) m.add(untag(x)); return m; }
+			memo.set(v, v);
+			if (v instanceof Date || v instanceof ArrayBuffer || ArrayBuffer.isView(v)) return v;
+			if (Array.isArray(v)) { for (let i = 0; i < v.length; i++) v[i] = untag(v[i]); return v; }
+			for (const k of Object.keys(v)) v[k] = untag(v[k]);
+			return v;
+		}
+		return untag(root);
+	};
 	Object.defineProperty(Object.prototype, 'toSource', { value: function toSource() { return u(this, []); }, writable: true, configurable: true, enumerable: false });
 })(globalThis);
 )JS";

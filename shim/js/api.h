@@ -313,7 +313,7 @@ void JSShim_RequestLeave(JSContext* cx);
 JS::PropertyKey INT_TO_JSID(int i);
 
 // ---- Structured clone (serialised with QuickJS's object writer) ----
-struct JSStructuredCloneData { std::vector<uint8_t> buf; };
+struct JSStructuredCloneData { std::vector<uint8_t> buf; bool tagged = false; };
 
 // ======== Batch: misc helpers, typed arrays, string chars, GC no-ops, hash map ========
 #include <unordered_map>
@@ -344,10 +344,12 @@ public:
 	ConstUTF8CharsZ(const char* s, size_t len) : p(s), n(len) {}
 };
 
-// JS::GCHashMap replacement (QuickJS refcounts, so no tracing is required).
+// JS::GCHashMap replacement. Keys are kept alive by the map (SpiderMonkey traced them): otherwise a freed
+// key's address could be reused by a different object and be mistaken for it.
 template<typename K, typename V, typename H, typename A>
 class GCHashMap {
-	std::unordered_map<JSObject*, V> m;
+	struct Slot { Heap<JSObject*> hold; V v{}; };
+	std::unordered_map<JSObject*, Slot> m;
 public:
 	class Entry { public: JSObject* k; V* v; JSObject* key() const { return k; } V& value() const { return *v; } };
 	class Ptr {
@@ -360,10 +362,14 @@ public:
 	using AddPtr = Ptr;
 	Ptr lookup(const K& key) {
 		Ptr p; auto it = m.find(key.get());
-		if (it != m.end()) { p.ok = true; p.e.k = it->first; p.e.v = &it->second; }
+		if (it != m.end()) { p.ok = true; p.e.k = it->first; p.e.v = &it->second.v; }
 		return p;
 	}
-	bool put(const K& key, const V& v) { m[key.get()] = v; return true; }
+	bool put(const K& key, const V& v) {
+		Slot& s = m[key.get()];
+		if (!s.hold.get()) s.hold = key.get();
+		s.v = v; return true;
+	}
 	bool has(const K& key) const { return m.count(key.get()) > 0; }
 	void clear() { m.clear(); }
 	size_t count() const { return m.size(); }
