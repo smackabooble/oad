@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Connection Test</title>
+<style>
+:root{--bg:#0f1115;--card:#171a21;--line:#2a2f3a;--text:#e6e8ee;--dim:#9aa3b2;--ok:#4cc38a;--bad:#ef6a6a;--warn:#e7b04b;--acc:#6ea8ff}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 system-ui,sans-serif;padding:20px}
+.wrap{max-width:720px;margin:0 auto;display:grid;gap:14px}h1{font-size:22px;margin:0 0 2px}p.sub{margin:0;color:var(--dim)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px}.card h2{font-size:15px;margin:0 0 8px;color:var(--dim);font-weight:600;text-transform:uppercase;letter-spacing:.05em}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}button{background:var(--acc);color:#07101f;border:0;border-radius:6px;padding:8px 14px;font:600 14px system-ui;cursor:pointer}button.sec{background:#2a2f3a;color:var(--text)}button:disabled{opacity:.5;cursor:default}
+input{background:#0f1115;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:8px 10px;font:600 16px ui-monospace,monospace;letter-spacing:.12em;text-transform:uppercase;width:170px}
+.chk{display:grid;grid-template-columns:22px 1fr;gap:2px 8px;margin:4px 0}.chk b{font-weight:600}.chk span{color:var(--dim);grid-column:2;font-size:13px}
+.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}.dim{color:var(--dim)}
+.code{font:700 28px ui-monospace,monospace;letter-spacing:.2em;color:#fff}
+#log{height:170px;overflow:auto;background:#0f1115;border:1px solid var(--line);border-radius:6px;padding:8px;font:13px ui-monospace,monospace;white-space:pre-wrap}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:2px 14px;font-size:14px}.kv div:nth-child(odd){color:var(--dim)}
+</style></head><body><div class="wrap">
+<div><h1>Connection Test</h1><p class="sub">Tests whether two browsers can connect directly (WebRTC). Open this page on two devices: one hosts, the other joins with the code.</p></div>
+
+<div class="card"><h2>1. Your network</h2><div id="net"><div class="dim">Running checks…</div></div><div class="row" style="margin-top:8px"><button class="sec" id="rerun">Run again</button></div></div>
+
+<div class="card"><h2>2. Connect two devices</h2>
+ <div class="row"><button id="host">Host a test room</button><span class="dim">or</span><input id="code" maxlength="9" placeholder="CODE" autocomplete="off"><button id="join" class="sec">Join</button></div>
+ <div id="room" style="margin-top:10px"></div></div>
+
+<div class="card" id="conn" style="display:none"><h2>3. Connection</h2>
+ <div class="kv"><div>State</div><div id="st">-</div><div>Path</div><div id="path">-</div><div>Latency</div><div id="rtt">-</div><div>Messages</div><div id="cnt">0 sent / 0 received</div></div>
+ <div class="row" style="margin-top:10px"><input id="msg" style="text-transform:none;letter-spacing:0;font:14px system-ui;width:260px" placeholder="Type a message"><button id="send">Send</button><button class="sec" id="blast" title="Send 200 messages and check order/loss">Stress test</button></div>
+ <div id="log" style="margin-top:10px"></div></div>
+</div>
+
+<script>/*PEERJS*/</script>
+<script>
+const ICE=[{urls:'stun:stun.l.google.com:19302'},{urls:'stun:global.stun.twilio.com:3478'},
+ {urls:['turn:openrelay.metered.ca:80','turn:openrelay.metered.ca:443','turn:openrelay.metered.ca:443?transport=tcp'],username:'openrelayproject',credential:'openrelayproject'}];
+const $=id=>document.getElementById(id);
+const q=new URLSearchParams(location.search).get('signal');
+function popts(){const o={debug:0,config:{iceServers:ICE}};if(q){const m=/^([^:/]+)(?::(\d+))?(\/.*)?$/.exec(q);if(m)Object.assign(o,{host:m[1],port:+(m[2]||9000),path:m[3]||'/',secure:m[1]!=='localhost'&&m[1]!=='127.0.0.1'});}return o;}
+const AL='ABCDEFGHJKLMNPQRSTUVWXYZ23456789',PRE='nettest-';
+const rid=n=>Array.from(crypto.getRandomValues(new Uint8Array(n)),b=>AL[b%32]).join('');
+function chk(ok,title,detail){return `<div class="chk"><b class="${ok===true?'ok':ok===false?'bad':'warn'}">${ok===true?'✓':ok===false?'✗':'!'}</b><div><b>${title}</b></div><span>${detail||''}</span></div>`}
+
+// ---------- 1. network check ----------
+async function netCheck(){
+  const out=$('net'); out.innerHTML='<div class="dim">Running checks…</div>'; let html='';
+  html+=chk(typeof RTCPeerConnection!=='undefined','WebRTC available',typeof RTCPeerConnection!=='undefined'?'This browser can make direct connections.':'This browser cannot do WebRTC.');
+  // broker
+  let brokerOk=await new Promise(res=>{let done=false;const p=new Peer(PRE+'chk-'+rid(8),popts());const t=setTimeout(()=>{if(!done){done=true;try{p.destroy()}catch(e){};res('timed out')}},9000);
+    p.on('open',()=>{if(!done){done=true;clearTimeout(t);p.destroy();res(true)}});p.on('error',e=>{if(!done){done=true;clearTimeout(t);try{p.destroy()}catch(_){};res(e.type||'error')}});});
+  html+=chk(brokerOk===true,'Matchmaking service (PeerJS)',brokerOk===true?'Reachable - rooms can be created.':'Not reachable ('+brokerOk+'). Rooms cannot be created from this network.');
+  out.innerHTML=html+'<div class="dim">Checking STUN/TURN…</div>';
+  // ICE gathering
+  const types={host:0,srflx:0,relay:0}; const addrs=new Set();
+  try{
+    const pc=new RTCPeerConnection({iceServers:ICE}); pc.createDataChannel('x');
+    pc.onicecandidate=e=>{if(e.candidate){const m=/ typ (\w+)/.exec(e.candidate.candidate);if(m&&m[1] in types)types[m[1]]++; const a=/ (\d+\.\d+\.\d+\.\d+|[0-9a-f:]+) \d+ typ srflx/.exec(e.candidate.candidate); if(a)addrs.add(a[1]);}};
+    await pc.setLocalDescription(await pc.createOffer());
+    await new Promise(r=>{const t=setTimeout(r,7000);pc.onicegatheringstatechange=()=>{if(pc.iceGatheringState==='complete'){clearTimeout(t);r()}}});
+    pc.close();
+  }catch(e){}
+  html+=chk(types.srflx>0,'STUN (finds your public address)',types.srflx>0?'Public address found'+(addrs.size?': '+[...addrs].join(', '):'')+'. Direct connections are usually possible.':'No public address found. Direct connections will probably fail unless the relay works.');
+  html+=chk(types.relay>0?true:'warn','TURN relay (fallback)',types.relay>0?'A relay is available if a direct route is blocked.':'No relay available (the free relay may be blocked or down).');
+  const good=brokerOk===true&&(types.srflx>0||types.relay>0);
+  html+=`<div style="margin-top:6px"><b class="${good?'ok':'bad'}">${good?'Looks good for online play.':'Online play may not work from this network.'}</b></div>`;
+  out.innerHTML=html;
+}
+$('rerun').onclick=netCheck; netCheck();
+
+// ---------- 2/3. rooms ----------
+let peer=null,conn=null,sent=0,got=0,pingT=0,stats=0,expect=0,ordered=true,blastIn=0;
+function log(s,c){const l=$('log');const d=document.createElement('div');if(c)d.className=c;d.textContent=new Date().toLocaleTimeString()+'  '+s;l.appendChild(d);l.scrollTop=l.scrollHeight}
+function count(){$('cnt').textContent=sent+' sent / '+got+' received'}
+function setSt(t,c){$('st').innerHTML='<b class="'+(c||'')+'">'+t+'</b>'}
+function attach(c){
+  conn=c; $('conn').style.display=''; setSt('Connecting…','warn');
+  c.on('open',()=>{setSt('Connected','ok');log('Connection open.','ok');ping();pingT=setInterval(ping,1000);stats=setInterval(pathInfo,2000);pathInfo()});
+  c.on('data',d=>{ if(d&&d.t==='ping'){c.send({t:'pong',s:d.s});return}
+    if(d&&d.t==='pong'){$('rtt').textContent=Math.round(performance.now()-d.s)+' ms';return}
+    if(d&&d.t==='blast'){blastIn++; if(d.i!==expect){ordered=false} expect=d.i+1; if(d.i===d.n-1){log('Stress test received: '+blastIn+'/'+d.n+' messages, '+(ordered&&blastIn===d.n?'in order, none lost ✓':'ORDER/LOSS PROBLEM ✗'),ordered&&blastIn===d.n?'ok':'bad');blastIn=0;expect=0;ordered=true}return}
+    got++;count();log('Friend: '+(d&&d.m!==undefined?d.m:JSON.stringify(d)))});
+  c.on('close',()=>{setSt('Disconnected','bad');log('Connection closed.','bad');clearInterval(pingT);clearInterval(stats)});
+  c.on('error',e=>{setSt('Error','bad');log('Error: '+(e.type||e),'bad')});
+}
+function ping(){if(conn&&conn.open)conn.send({t:'ping',s:performance.now()})}
+async function pathInfo(){
+  try{const pc=conn.peerConnection;const st=await pc.getStats();let pair=null;const cands={};
+    st.forEach(r=>{if(r.type==='candidate-pair'&&(r.state==='succeeded'&&r.nominated||r.selected))pair=r;if(r.type==='local-candidate'||r.type==='remote-candidate')cands[r.id]=r});
+    if(!pair){st.forEach(r=>{if(r.type==='transport'&&r.selectedCandidatePairId)pair=st.get(r.selectedCandidatePairId)})}
+    if(pair){const L=cands[pair.localCandidateId],R=cands[pair.remoteCandidateId];const lt=L&&L.candidateType,rt=R&&R.candidateType;
+      const relayed=lt==='relay'||rt==='relay';$('path').innerHTML='<b class="'+(relayed?'warn':'ok')+'">'+(relayed?'Relayed (through a TURN server)':'Direct (peer to peer)')+'</b> <span class="dim">'+lt+' ↔ '+rt+'</span>'}
+  }catch(e){}
+}
+function reset(){if(peer){try{peer.destroy()}catch(e){}}peer=null;conn=null;sent=got=0;count();clearInterval(pingT);clearInterval(stats);$('log').textContent='';$('rtt').textContent='-';$('path').textContent='-'}
+$('host').onclick=()=>{reset();const code=rid(8);setSt('Waiting for a friend…','warn');$('conn').style.display='';
+  const p=peer=new Peer(PRE+code,popts());
+  p.on('open',()=>{$('room').innerHTML='<div class="dim">Room code - give this to the other device:</div><div class="code">'+code.slice(0,4)+'-'+code.slice(4)+'</div>';log('Room created. Waiting for someone to join…')});
+  p.on('connection',c=>{log('Someone is connecting…');attach(c)});
+  p.on('error',e=>{log('Matchmaking error: '+e.type,'bad');setSt('Error','bad');$('room').innerHTML='<b class="bad">Could not create a room ('+e.type+').</b>'});};
+$('join').onclick=()=>{const code=$('code').value.toUpperCase().replace(/[^A-Z0-9]/g,'');if(code.length!==8){alert('Enter the 8-character code from the host.');return}
+  reset();$('conn').style.display='';setSt('Connecting…','warn');$('room').innerHTML='';
+  const p=peer=new Peer(PRE+'c-'+rid(8),popts());const t=setTimeout(()=>{log('Timed out - could not connect (strict firewall?).','bad');setSt('Failed','bad')},25000);
+  p.on('open',()=>{const c=p.connect(PRE+code,{reliable:true});c.on('open',()=>clearTimeout(t));attach(c)});
+  p.on('error',e=>{clearTimeout(t);log(e.type==='peer-unavailable'?'No room with that code.':'Error: '+e.type,'bad');setSt('Failed','bad')});};
+$('send').onclick=()=>{const v=$('msg').value;if(!v||!conn||!conn.open)return;conn.send({m:v});sent++;count();log('You: '+v);$('msg').value=''};
+$('msg').onkeydown=e=>{if(e.key==='Enter')$('send').click()};
+$('blast').onclick=()=>{if(!conn||!conn.open)return;const n=200;for(let i=0;i<n;i++)conn.send({t:'blast',i,n});log('Stress test: sent '+n+' messages.')};
+</script></body></html>
